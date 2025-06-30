@@ -20,22 +20,25 @@ loss_calculator_type = os.getenv("LOSS_CALCULATOR")
 
 START_OF_CONTEXT_TOKEN = "<SOC>"
 END_OF_CONTEXT_TOKEN = "<EOT>"
+DEFAULT_EMA_DECAY = 0.99
 
 loss_calculator = loss_calculator_builder(loss_calculator_type).build()
-
-# Targets
 target_creator = masker_builder(target_mask_strategy).build()
-
-# Contexts
 context_creator = masker_builder(context_mask_strategy).build()
-
-
 context_encoder = encoder_builder(context_encoder_type).build()
-target_encoder = encoder_builder(target_predictor_type).build()
-patcher = patcher_builder(patch_strategy).build()
+
+# Always depends on the context encoder
+target_encoder = ema_target_encoder(
+    context_encoder, DEFAULT_EMA_DECAY)
+
+# Always depends on the context encoder and target_encoder
+patcher = patcher_builder(patch_strategy).build(
+    context_encoder, target_encoder)
 dataloader = dataloader_builder(training_dataset).build()
 
-target_predictor = target_encoder(context_encoder)
+
+# TODO: This should be a small target predictor, need to pass in a config for this later.
+target_predictor = encoder_builder(context_encoder_type)
 
 for raw_text in dataloader:
     patches = patcher.create_patches(raw_text)

@@ -1,9 +1,6 @@
 from src.builders.base_builder import EnumBuilder
 from enum import Enum
-
-
-class Longformer:
-    pass
+from src.encoders.context_encoders.longformer import Longformer
 
 
 class EncodingStrategy(Enum):
