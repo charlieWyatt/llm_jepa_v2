@@ -21,12 +21,13 @@ loss_calculator_type = os.getenv("LOSS_CALCULATOR")
 START_OF_CONTEXT_TOKEN = "<SOC>"
 END_OF_CONTEXT_TOKEN = "<EOT>"
 DEFAULT_EMA_DECAY = 0.99
+BATCH_SIZE = 4
 
 loss_calculator = loss_calculator_builder(loss_calculator_type).build()
 target_creator = masker_builder(target_mask_strategy).build()
 context_creator = masker_builder(context_mask_strategy).build()
 context_encoder = encoder_builder(context_encoder_type).build()
-
+tokenizer = context_encoder.tokenizer
 # Always depends on the context encoder
 target_encoder = ema_target_encoder(
     context_encoder, DEFAULT_EMA_DECAY)
@@ -34,28 +35,29 @@ target_encoder = ema_target_encoder(
 # Always depends on the context encoder and target_encoder
 patcher = patcher_builder(patch_strategy).build(
     context_encoder, target_encoder)
-dataloader = dataloader_builder(training_dataset).build()
+dataloader = dataloader_builder(training_dataset).build(
+    patcher, batch_size=BATCH_SIZE)
 
 
 # TODO: This should be a small target predictor, need to pass in a config for this later.
 target_predictor = encoder_builder(context_encoder_type)
 
-for raw_text in dataloader:
-    patches = patcher.create_patches(raw_text)
-    encoded_target = target_encoder(patches)
+for patch_batch in dataloader:
+    for patches in patch_batch:
+        targets = target_creator.create_spans(patches)
+        context = context_creator.create_spans(patches)
 
-    targets = target_creator.create_spans(patches)
-    context = context_creator.create_spans(patches)
+        encoded_context = context_encoder(context)
+        encoded_target = target_encoder(patches)
 
-    encoded_context = context_encoder(context)
+        predicted_targets = []
+        for target in targets:
+            predicted_targets.append(
+                target_predictor(START_OF_CONTEXT_TOKEN +
+                                 encoded_context + END_OF_CONTEXT_TOKEN + target)
+            )
 
-    predicted_targets = []
-    for target in targets:
-        predicted_targets.append(target_predictor(
-            START_OF_CONTEXT_TOKEN + encoded_context + END_OF_CONTEXT_TOKEN + target))
-
-    loss = loss_calculator(encoded_target, predicted_targets)
-
-    target_encoder.update()
+        loss = loss_calculator(encoded_target, predicted_targets)
+        target_encoder.update()
 
     # Updates
