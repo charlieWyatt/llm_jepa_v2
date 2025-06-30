@@ -1,13 +1,15 @@
-from pydantic import BaseModel
+from src.builders.base_builder import EnumBuilder
+from enum import Enum
 
 
-class PatchStrategy(BaseModel):
-    token = "token"
+class TokenPatcher:
+    pass
 
 
-class patcher_builder:
+class PatchStrategy(Enum):
+    token = TokenPatcher
 
-    def __init__(self, strategy) -> None:
-        if not PatchStrategy(strategy):
-            raise Exception(f"Dataset: {strategy} does not exist")
-        pass
+
+class patcher_builder(EnumBuilder[PatchStrategy]):
+    def __init__(self, strategy: str | None) -> None:
+        super().__init__(strategy, PatchStrategy, label="Patch Strategy")

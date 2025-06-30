@@ -1,13 +1,15 @@
-from pydantic import BaseModel
+from src.builders.base_builder import EnumBuilder
+from enum import Enum
 
 
-class Dataset(BaseModel):
-    receipe = "recipe"
+class RecipeDataloader:
+    pass
 
 
-class dataloader_builder:
+class Dataset(Enum):
+    recipe = RecipeDataloader
 
-    def __init__(self, dataset) -> None:
-        if not Dataset(dataset):
-            raise Exception(f"Dataset: {dataset} does not exist")
-        pass
+
+class dataloader_builder(EnumBuilder[Dataset]):
+    def __init__(self, dataset: str | None):
+        super().__init__(dataset, Dataset, label="Dataset")
