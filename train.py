@@ -23,10 +23,23 @@ END_OF_CONTEXT_TOKEN = "<EOT>"
 DEFAULT_EMA_DECAY = 0.99
 BATCH_SIZE = 4
 
+CONTEXT_ENCODER_CONFIG = {
+    "hidden_size": 384,
+    "num_layers": 6,
+    "attention_window": 256
+}
+
+TARGET_ENCODER_CONFIG = {
+    "hidden_size": 384,
+    "num_layers": 2,
+    "attention_window": 256
+}
+
 loss_calculator = loss_calculator_builder(loss_calculator_type).build()
 target_creator = masker_builder(target_mask_strategy).build()
 context_creator = masker_builder(context_mask_strategy).build()
-context_encoder = encoder_builder(context_encoder_type).build()
+context_encoder = encoder_builder(
+    context_encoder_type).build(CONTEXT_ENCODER_CONFIG)
 tokenizer = context_encoder.tokenizer
 # Always depends on the context encoder
 target_encoder = ema_target_encoder(
@@ -39,8 +52,8 @@ dataloader = dataloader_builder(training_dataset).build(
     patcher, batch_size=BATCH_SIZE)
 
 
-# TODO: This should be a small target predictor, need to pass in a config for this later.
-target_predictor = encoder_builder(context_encoder_type)
+target_predictor = encoder_builder(
+    target_predictor_type).build(TARGET_ENCODER_CONFIG)
 
 for patch_batch in dataloader:
     for patches in patch_batch:
