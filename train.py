@@ -4,19 +4,16 @@ from src.builders.masker_builder import masker_builder
 from src.builders.encoder_builder import encoder_builder
 from src.encoders.target_encoders.ema_target_encoder import ema_target_encoder
 from src.builders.loss_calculator_builder import loss_calculator_builder
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
+from config import STRATEGY_CONSTS
 
 
-training_dataset = os.getenv("TRAINING_DATASET")
-patch_strategy = os.getenv("PATCH_STRATEGY")
-target_mask_strategy = os.getenv("MASK_STRATEGY")
-context_mask_strategy = os.getenv("CONTEXT_STRATEGY")
-context_encoder_type = os.getenv("CONTEXT_ENCODER")
-target_predictor_type = os.getenv("TARGET_PREDICTOR")
-loss_calculator_type = os.getenv("LOSS_CALCULATOR")
+training_dataset = STRATEGY_CONSTS['TRAINING_DATASET']
+patch_strategy = STRATEGY_CONSTS["PATCH_STRATEGY"]
+target_mask_strategy = STRATEGY_CONSTS["MASK_STRATEGY"]
+context_mask_strategy = STRATEGY_CONSTS["CONTEXT_STRATEGY"]
+context_encoder_type = STRATEGY_CONSTS["CONTEXT_ENCODER"]
+target_predictor_type = STRATEGY_CONSTS["TARGET_PREDICTOR"]
+loss_calculator_type = STRATEGY_CONSTS["LOSS_CALCULATOR"]
 
 START_OF_CONTEXT_TOKEN = "<SOC>"
 END_OF_CONTEXT_TOKEN = "<EOT>"
