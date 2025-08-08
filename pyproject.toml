@@ -13,6 +13,8 @@ python-dotenv = "^1.1.0"
 pydantic = "^2.11.7"
 transformers = "^4.53.0"
 datasets = "^3.6.0"
+kfp = "^2.14.2"
+google-cloud-aiplatform = "^1.107.0"
 
 
 [tool.poetry.group.dev.dependencies]
