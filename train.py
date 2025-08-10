@@ -1,3 +1,4 @@
+import sys
 import logging
 from src.builders.dataloader_builder import dataloader_builder
 from src.builders.patcher_builder import patcher_builder
@@ -11,9 +12,13 @@ from config import STRATEGY_CONSTS
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 logger.info("Starting training pipeline setup...")
 
@@ -74,7 +79,7 @@ logger.info("Components built successfully.")
 
 logger.info("Starting training loop...")
 for patch_batch in dataloader:
-    logger.info("Patch: ", patch_batch)
+    logger.info(f"Patch: {patch_batch}")
     for patches in patch_batch:
         targets = target_creator.create_spans(patches)
         context = context_creator.create_spans(patches)
