@@ -25,9 +25,9 @@ context_encoder_type = STRATEGY_CONSTS["CONTEXT_ENCODER"]
 target_predictor_type = STRATEGY_CONSTS["TARGET_PREDICTOR"]
 loss_calculator_type = STRATEGY_CONSTS["LOSS_CALCULATOR"]
 
-logger.debug(f"Training dataset: {training_dataset}")
-logger.debug(f"Patch strategy: {patch_strategy}")
-logger.debug(f"Context encoder type: {context_encoder_type}")
+logger.info(f"Training dataset: {training_dataset}")
+logger.info(f"Patch strategy: {patch_strategy}")
+logger.info(f"Context encoder type: {context_encoder_type}")
 
 START_OF_CONTEXT_TOKEN = "<SOC>"
 END_OF_CONTEXT_TOKEN = "<EOT>"
