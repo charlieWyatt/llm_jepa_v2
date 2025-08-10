@@ -17,17 +17,8 @@ class DolmaSampleDataloader:
         )
 
     def _format_example(self, ex) -> str:
-        title = ex.get("metadata", {}).get(
-            "title") or ex.get("title") or "(untitled)"
         text = ex.get("text", "")
-        url = ex.get("id", "") or ex.get("metadata", {}).get("url", "")
-        return dedent(f"""
-        {title}
-
-        Source: {url}
-
-        {text}
-        """).strip()
+        return text
 
     def __iter__(self):
         batch = []
