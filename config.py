@@ -1,5 +1,5 @@
 STRATEGY_CONSTS = {
-    "TRAINING_DATASET": "recipe",
+    "TRAINING_DATASET": "dolma_sample",
     "PATCH_STRATEGY": "token",
     "MASK_STRATEGY": "random",
     "CONTEXT_STRATEGY": "random",

@@ -1,10 +1,12 @@
 from src.builders.base_builder import EnumBuilder
 from enum import Enum
 from src.dataloaders.recipe1m_dataloader import RecipeDataloader
+from src.dataloaders.dolma_sample_dataloader import DolmaSampleDataloader
 
 
 class Dataset(Enum):
     recipe = RecipeDataloader
+    dolma_sample = DolmaSampleDataloader
 
 
 class dataloader_builder(EnumBuilder[Dataset]):
