@@ -1,3 +1,4 @@
+import logging
 from src.builders.dataloader_builder import dataloader_builder
 from src.builders.patcher_builder import patcher_builder
 from src.builders.masker_builder import masker_builder
@@ -7,6 +8,15 @@ from src.builders.loss_calculator_builder import loss_calculator_builder
 from config import STRATEGY_CONSTS
 
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="[%(asctime)s] [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+logger.info("Starting training pipeline setup...")
+
 training_dataset = STRATEGY_CONSTS['TRAINING_DATASET']
 patch_strategy = STRATEGY_CONSTS["PATCH_STRATEGY"]
 target_mask_strategy = STRATEGY_CONSTS["MASK_STRATEGY"]
@@ -14,6 +24,10 @@ context_mask_strategy = STRATEGY_CONSTS["CONTEXT_STRATEGY"]
 context_encoder_type = STRATEGY_CONSTS["CONTEXT_ENCODER"]
 target_predictor_type = STRATEGY_CONSTS["TARGET_PREDICTOR"]
 loss_calculator_type = STRATEGY_CONSTS["LOSS_CALCULATOR"]
+
+logger.debug(f"Training dataset: {training_dataset}")
+logger.debug(f"Patch strategy: {patch_strategy}")
+logger.debug(f"Context encoder type: {context_encoder_type}")
 
 START_OF_CONTEXT_TOKEN = "<SOC>"
 END_OF_CONTEXT_TOKEN = "<EOT>"
@@ -32,6 +46,7 @@ TARGET_ENCODER_CONFIG = {
     "attention_window": 256
 }
 
+logger.info("Building components...")
 loss_calculator = loss_calculator_builder(loss_calculator_type).build()
 target_creator = masker_builder(target_mask_strategy).build()
 context_creator = masker_builder(context_mask_strategy).build()
@@ -55,7 +70,9 @@ target_predictor = encoder_builder(target_predictor_type).build(
     model_id=STRATEGY_CONSTS["TARGET_MODEL_ID"],
     config=TARGET_ENCODER_CONFIG,
 )
+logger.info("Components built successfully.")
 
+logger.info("Starting training loop...")
 for patch_batch in dataloader:
     for patches in patch_batch:
         targets = target_creator.create_spans(patches)
@@ -72,6 +89,8 @@ for patch_batch in dataloader:
             )
 
         loss = loss_calculator(encoded_target, predicted_targets)
+        logger.debug(f"    Loss: {loss}")
         target_encoder.update()
 
-    # Updates
+logger.info("Training loop finished.")
+# Updates
