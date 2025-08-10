@@ -74,6 +74,7 @@ logger.info("Components built successfully.")
 
 logger.info("Starting training loop...")
 for patch_batch in dataloader:
+    logger.info("Patch: ", patch_batch)
     for patches in patch_batch:
         targets = target_creator.create_spans(patches)
         context = context_creator.create_spans(patches)
@@ -91,6 +92,7 @@ for patch_batch in dataloader:
         loss = loss_calculator(encoded_target, predicted_targets)
         logger.debug(f"    Loss: {loss}")
         target_encoder.update()
+        logger.info("Updated!")
 
 logger.info("Training loop finished.")
 # Updates
