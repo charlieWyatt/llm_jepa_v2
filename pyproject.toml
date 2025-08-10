@@ -15,6 +15,7 @@ transformers = "^4.53.0"
 datasets = "^3.6.0"
 kfp = "^2.14.2"
 google-cloud-aiplatform = "^1.107.0"
+gcsfs = "2025.3.0"
 
 
 [tool.poetry.group.dev.dependencies]

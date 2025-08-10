@@ -3,33 +3,30 @@ from src.encoders.base import ContextEncoder
 
 
 class Longformer(ContextEncoder):
-    def __init__(self, model_name="allenai/longformer-base-4096", config=None):
+    def __init__(self, model_id: str = "allenai/longformer-base-4096", config: dict | None = None):
         super().__init__()
+        if not isinstance(model_id, str):
+            raise TypeError(
+                "model_id must be a Hugging Face repo id or path string")
 
-        config = config or {}
-        self.hidden_size = config.get("hidden_size", 256)
-        self.num_layers = config.get("num_layers", 4)
-        self.attention_window = config.get("attention_window", 512)
+        self._tokenizer = LongformerTokenizer.from_pretrained(model_id)
 
-        self._tokenizer = LongformerTokenizer.from_pretrained(model_name)
-        config = LongformerConfig.from_pretrained(model_name)
-        self.model = LongformerModel.from_pretrained(model_name, config=config)
+        if config:  # custom architecture → random init
+            base = LongformerConfig.from_pretrained(model_id)
+            for k, v in config.items():
+                if hasattr(base, k):
+                    setattr(base, k, v)
+            # random weights with overridden config
+            self.model = LongformerModel(base)
+        else:       # use pretrained checkpoint as-is
+            self.model = LongformerModel.from_pretrained(model_id)
 
     @property
     def tokenizer(self):
         return self._tokenizer
 
     def forward(self, input_texts):
-        """
-        input_texts: List[str] or str
-        Returns: torch.Tensor (hidden states)
-        """
-        # Tokenize and move tensors to model device
         inputs = self.tokenizer(
-            input_texts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-            max_length=4096,
+            input_texts, padding=True, truncation=True, return_tensors="pt", max_length=4096
         )
         return self.model(**inputs).last_hidden_state

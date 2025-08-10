@@ -35,8 +35,10 @@ TARGET_ENCODER_CONFIG = {
 loss_calculator = loss_calculator_builder(loss_calculator_type).build()
 target_creator = masker_builder(target_mask_strategy).build()
 context_creator = masker_builder(context_mask_strategy).build()
-context_encoder = encoder_builder(
-    context_encoder_type).build(CONTEXT_ENCODER_CONFIG)
+context_encoder = encoder_builder(context_encoder_type).build(
+    model_id=STRATEGY_CONSTS["CONTEXT_MODEL_ID"],
+    config=CONTEXT_ENCODER_CONFIG,
+)
 tokenizer = context_encoder.tokenizer
 # Always depends on the context encoder
 target_encoder = ema_target_encoder(
@@ -49,8 +51,10 @@ dataloader = dataloader_builder(training_dataset).build(
     patcher, batch_size=BATCH_SIZE)
 
 
-target_predictor = encoder_builder(
-    target_predictor_type).build(TARGET_ENCODER_CONFIG)
+target_predictor = encoder_builder(target_predictor_type).build(
+    model_id=STRATEGY_CONSTS["TARGET_MODEL_ID"],
+    config=TARGET_ENCODER_CONFIG,
+)
 
 for patch_batch in dataloader:
     for patches in patch_batch:
