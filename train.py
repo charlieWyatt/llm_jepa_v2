@@ -7,7 +7,9 @@ from src.builders.encoder_builder import encoder_builder
 from src.encoders.target_encoders.ema_target_encoder import ema_target_encoder
 from src.builders.loss_calculator_builder import loss_calculator_builder
 from config import STRATEGY_CONSTS
-
+from torch.cuda.amp import GradScaler
+from contextlib import nullcontext
+import torch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +23,36 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 logger.info("Starting training pipeline setup...")
+
+use_cuda = torch.cuda.is_available()
+amp_ctx = torch.autocast(
+    device_type="cuda", dtype=torch.float16) if use_cuda else nullcontext()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+scaler = GradScaler(enabled=use_cuda)
+
+logger.info(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+
+
+def maybe_to_cuda(module):
+    # If it looks like an nn.Module, move it
+    if hasattr(module, "to") and callable(getattr(module, "to")):
+        module.to(device)
+    return module
+
+
+def to_device(x):
+    # Recursively move tensors in common containers
+    if torch.is_tensor(x):
+        return x.to(device)
+    if isinstance(x, dict):
+        return {k: to_device(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        t = [to_device(v) for v in x]
+        return type(x)(t)
+    return x
+
 
 training_dataset = STRATEGY_CONSTS['TRAINING_DATASET']
 patch_strategy = STRATEGY_CONSTS["PATCH_STRATEGY"]
@@ -75,34 +107,67 @@ target_predictor = encoder_builder(target_predictor_type).build(
     model_id=STRATEGY_CONSTS["TARGET_MODEL_ID"],
     config=TARGET_ENCODER_CONFIG,
 )
+
+
+context_encoder = maybe_to_cuda(context_encoder)
+target_encoder = maybe_to_cuda(target_encoder)
+target_predictor = maybe_to_cuda(target_predictor)
+loss_calculator = maybe_to_cuda(loss_calculator)
+
+
+params = []
+for m in (context_encoder, target_encoder, target_predictor):
+    if hasattr(m, "parameters"):
+        params += list(m.parameters())
+optimizer = torch.optim.AdamW([p for p in params if p.requires_grad], lr=1e-4)
+
+torch.backends.cudnn.benchmark = True
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+
 logger.info("Components built successfully.")
 
 logger.info("Starting training loop...")
 for patch_batch in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+
+    patch_batch = to_device(patch_batch)
     for patches in patch_batch:
         targets = target_creator.create_spans(patches)
         context = context_creator.create_spans(patches)
 
+        targets = to_device(targets)
+        context = to_device(context)
+
         logger.info(f"targets: {targets}")
         logger.info(f"context: {context}")
 
-        encoded_context = context_encoder(context)
-        encoded_target = target_encoder(patches)
+        with amp_ctx:
+            encoded_context = context_encoder(context)
+            encoded_target = target_encoder(patches)
 
-        logger.info(f"encoded targets: {encoded_target}")
-        logger.info(f"encoded context: {encoded_context}")
+            # If your encoders return dicts or non-tensors, adapt `to_device`/loss accordingly
+            predicted_targets = []
+            for target in targets:
+                # If target/context need tokenization, make sure tensors end up on `device`
+                pred = target_predictor(
+                    START_OF_CONTEXT_TOKEN + encoded_context + END_OF_CONTEXT_TOKEN + target
+                )
+                predicted_targets.append(pred)
 
-        predicted_targets = []
-        for target in targets:
-            predicted_targets.append(
-                target_predictor(START_OF_CONTEXT_TOKEN +
-                                 encoded_context + END_OF_CONTEXT_TOKEN + target)
-            )
-        logger.info(f"predicted_targets: {predicted_targets}")
+            loss = loss_calculator(encoded_target, predicted_targets)
 
-        loss = loss_calculator(encoded_target, predicted_targets)
-        logger.debug(f"    Loss: {loss}")
+        # Backprop + step
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
         target_encoder.update()
+
+        logger.debug(f"    Loss: {loss}")
         logger.info("Updated!")
 
 logger.info("Training loop finished.")
