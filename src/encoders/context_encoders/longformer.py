@@ -1,5 +1,6 @@
 from transformers import LongformerConfig, LongformerModel, LongformerTokenizer
 from src.encoders.base import ContextEncoder
+import torch
 
 
 class Longformer(ContextEncoder):
@@ -29,4 +30,9 @@ class Longformer(ContextEncoder):
         inputs = self.tokenizer(
             input_texts, padding=True, truncation=True, return_tensors="pt", max_length=4096
         )
+
+        device = next(self.model.parameters()).device
+        inputs = {k: (v.to(device) if hasattr(v, "to") else v)
+                  for k, v in inputs.items()}
+
         return self.model(**inputs).last_hidden_state
