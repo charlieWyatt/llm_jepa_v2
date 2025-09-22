@@ -1,0 +1,17 @@
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+# Optional: keep apt non-interactive if you later add apt packages
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# Install Python deps with the image's built-in python/pip (Conda)
+COPY requirements.txt .
+RUN python -m pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Copy your code
+COPY . .
+
+# Run your training
+CMD ["python", "train.py"]

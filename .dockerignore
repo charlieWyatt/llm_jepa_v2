@@ -1,0 +1,6 @@
+data/
+results/
+*.log
+*.tmp
+__pycache__/
+.env
