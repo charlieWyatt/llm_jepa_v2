@@ -41,6 +41,9 @@ We use `conda`.
 
 
 To activate `conda` we do - `conda activate cw9909`
+To run on deepspeed you need to - `module load cuda/12.8.0`
+`deepspeed --num_gpus 2 /home/561/cw9909/experiments/llm_jepa_v2/train.py`
+
 
 To submit a job, we run - `qsub run_train_two_a100.pbs` this will return a runid
 
