@@ -10,6 +10,22 @@ from config import STRATEGY_CONSTS
 from torch.cuda.amp import GradScaler
 from contextlib import nullcontext
 import torch
+import os
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+def ddp_init():
+    if torch.cuda.is_available() and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return True, local_rank, dist.get_world_size()
+    return False, 0, 1
+
+IS_DDP, LOCAL_RANK, WORLD_SIZE = ddp_init()
+RANK = int(os.environ.get("RANK", "0"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,18 +35,23 @@ logging.basicConfig(
     force=True,
 )
 
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 logger.info("Starting training pipeline setup...")
 
 use_cuda = torch.cuda.is_available()
-amp_ctx = torch.autocast(
-    device_type="cuda", dtype=torch.float16) if use_cuda else nullcontext()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device(f"cuda:{LOCAL_RANK}") if use_cuda else torch.device("cpu")
+amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if use_cuda else nullcontext()
 scaler = GradScaler(enabled=use_cuda)
 
-logger.info(f"CUDA available: {torch.cuda.is_available()}")
+
+# Log only on the first rank
+def logi(msg): 
+    if RANK == 0: logger.info(msg)
+
+logi(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
@@ -62,9 +83,9 @@ context_encoder_type = STRATEGY_CONSTS["CONTEXT_ENCODER"]
 target_predictor_type = STRATEGY_CONSTS["TARGET_PREDICTOR"]
 loss_calculator_type = STRATEGY_CONSTS["LOSS_CALCULATOR"]
 
-logger.info(f"Training dataset: {training_dataset}")
-logger.info(f"Patch strategy: {patch_strategy}")
-logger.info(f"Context encoder type: {context_encoder_type}")
+logi(f"Training dataset: {training_dataset}")
+logi(f"Patch strategy: {patch_strategy}")
+logi(f"Context encoder type: {context_encoder_type}")
 
 START_OF_CONTEXT_TOKEN = "<SOC>"
 END_OF_CONTEXT_TOKEN = "<EOT>"
@@ -83,7 +104,7 @@ TARGET_ENCODER_CONFIG = {
     "attention_window": 256
 }
 
-logger.info("Building components...")
+logi("Building components...")
 loss_calculator = loss_calculator_builder(loss_calculator_type).build()
 target_creator = masker_builder(target_mask_strategy).build()
 context_creator = masker_builder(context_mask_strategy).build()
@@ -114,6 +135,11 @@ target_encoder = maybe_to_cuda(target_encoder)
 target_predictor = maybe_to_cuda(target_predictor)
 loss_calculator = maybe_to_cuda(loss_calculator)
 
+if IS_DDP:
+    # Only wrap the *trainable* modules you step with the optimizer
+    context_encoder = DDP(context_encoder, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, find_unused_parameters=True)
+    target_predictor = DDP(target_predictor, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, find_unused_parameters=True)
+
 
 params = []
 for m in (context_encoder, target_encoder, target_predictor):
@@ -128,9 +154,9 @@ except Exception:
     pass
 
 
-logger.info("Components built successfully.")
+logi("Components built successfully.")
 
-logger.info("Starting training loop...")
+logi("Starting training loop...")
 for patch_batch in dataloader:
     optimizer.zero_grad(set_to_none=True)
 
@@ -141,9 +167,6 @@ for patch_batch in dataloader:
 
         targets = to_device(targets)
         context = to_device(context)
-
-        logger.info(f"targets: {targets}")
-        logger.info(f"context: {context}")
 
         with amp_ctx:
             encoded_context = context_encoder(context)
@@ -167,8 +190,13 @@ for patch_batch in dataloader:
 
         target_encoder.update()
 
-        logger.debug(f"    Loss: {loss}")
-        logger.info("Updated!")
+        logi.debug(f"    Loss: {loss}")
+        logi("Updated!")
 
-logger.info("Training loop finished.")
+logi("Training loop finished.")
 # Updates
+
+
+if IS_DDP:
+    dist.barrier()
+    dist.destroy_process_group()

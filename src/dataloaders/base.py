@@ -1,6 +1,10 @@
 from abc import ABC, abstractmethod
+from dotenv import load_dotenv
+import os
 
-BASE_DATASET_PATH = "data"
+load_dotenv()
+
+BASE_DATASET_PATH = os.getenv('BASE_DATA_PATH')
 
 class BaseDataloader(ABC):
     def __init__(self, patcher, batch_size: int = 1):

@@ -1,30 +1,31 @@
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig
 from textwrap import dedent
+from pathlib import Path
 
-GCS_GLOB = "gs://llm_jepa/pipeline-root/dolma/v1_6-sample/**/*.json.gz"
+# Path to the local folder that holds all the .json files
+LOCAL_GLOB = "/g/data/oy87/cw9909/dolma_sample/json/*.json"
 
 
 class DolmaSampleDataloader:
-    def __init__(self, patcher, batch_size: int = 1, streaming=True):
+    def __init__(self, patcher, batch_size: int = 1, streaming=False):
         self.batch_size = batch_size
         self.patcher = patcher
+        # load all the local json files
         self.dataset = load_dataset(
             "json",
-            data_files=GCS_GLOB,
+            data_files=LOCAL_GLOB,
             split="train",
-            # stream directly from GCS (no full download)
-            streaming=streaming,
+            streaming=True,                              # no Arrow caching, no temp copies
+            download_config=DownloadConfig(local_files_only=True),
         )
 
     def _format_example(self, ex) -> str:
-        text = ex.get("text", "")
-        return text
+        return ex.get("text", "")
 
     def __iter__(self):
         batch = []
         for ex in self.dataset:
-            formatted = self._format_example(ex)
-            patches = self.patcher.create_patches(formatted)
+            patches = self.patcher.create_patches(self._format_example(ex))
             batch.append(patches)
             if len(batch) == self.batch_size:
                 yield batch

@@ -1,0 +1,26 @@
+#!/bin/bash
+#PBS -P oy87
+# Queue with A100 GPUs:
+#PBS -q dgxa100
+# 2 A100 GPUs, about 16 CPUs per GPU, 64 GB total memory
+#PBS -l ngpus=2
+#PBS -l ncpus=32
+#PBS -l mem=64GB
+#PBS -l jobfs=200GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=gdata/oy87
+#PBS -l wd
+
+set -euo pipefail
+
+export HF_HOME=/g/data/oy87/cw9909/hf_home
+export TRANSFORMERS_CACHE=$HF_HOME/transformers
+export HF_DATASETS_CACHE=$HF_HOME/datasets
+
+conda activate cw9909
+
+python -V
+which python
+nvidia-smi
+
+torchrun --standalone --nproc_per_node=2 /home/561/cw9909/experiments/llm_jepa_v2/train.py
