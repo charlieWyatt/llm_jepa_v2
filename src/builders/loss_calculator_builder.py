@@ -1,5 +1,6 @@
 from src.builders.base_builder import EnumBuilder
 from enum import Enum
+from typing import Literal
 import torch
 
 
@@ -26,6 +27,10 @@ class L2LossCalculator:
 
 class LossStrategy(Enum):
     l2 = L2LossCalculator
+
+
+# Type for configuration
+LossCalculatorType = Literal["l2"]
 
 
 class loss_calculator_builder(EnumBuilder[LossStrategy]):

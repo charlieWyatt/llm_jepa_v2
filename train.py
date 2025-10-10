@@ -1,4 +1,6 @@
 # train.py
+from src.maskers.block_mask_generator import BlockMaskGenerator
+from src.maskers.random_mask_generator import RandomMaskGenerator
 import sys
 import os
 import logging
@@ -8,7 +10,6 @@ import deepspeed
 
 from src.builders.dataloader_builder import dataloader_builder
 from src.builders.patcher_builder import patcher_builder
-from src.builders.masker_builder import masker_builder
 from src.builders.encoder_builder import encoder_builder
 from src.encoders.target_encoders.ema_target_encoder import ema_target_encoder
 from src.builders.loss_calculator_builder import loss_calculator_builder
@@ -135,13 +136,28 @@ DS_CONFIG = {
 logi("Building components...")
 loss_calculator = loss_calculator_builder(loss_calculator_type).build()
 
-# Create context-target creator for JEPA-style training
-context_strategy = masker_builder(context_mask_strategy).build()
-target_strategy = masker_builder(target_mask_strategy).build()
+# Create mask generators for context and targets
+# Context generator (what the model can see)
+if context_mask_strategy == "random":
+    context_generator = RandomMaskGenerator(mask_ratio=0.6)  # 60% visible
+elif context_mask_strategy == "block":
+    context_generator = BlockMaskGenerator(
+        span_length=50)  # Large visible block
+else:
+    raise ValueError(f"Unknown context strategy: {context_mask_strategy}")
 
+# Target generator (what to predict)
+if target_mask_strategy == "random":
+    target_generator = RandomMaskGenerator(mask_ratio=0.15)  # 15% to predict
+elif target_mask_strategy == "block":
+    target_generator = BlockMaskGenerator(span_length=10)  # 10-token block
+else:
+    raise ValueError(f"Unknown target strategy: {target_mask_strategy}")
+
+# Create context-target creator for JEPA-style training
 context_target_creator = ContextTargetCreator(
-    context_strategy=context_strategy,
-    target_strategy=target_strategy,
+    context_generator=context_generator,
+    target_generator=target_generator,
     num_targets=1  # Single target for now (can increase for multi-target JEPA)
 )
 
@@ -195,83 +211,118 @@ class PredictorHead(nn.Module):
 # ----------------------------
 
 
-class TrainableJEPA(nn.Module):
+class SimplePredictor(nn.Module):
     """
-    I-JEPA style model for text:
-    - Takes full sequence + attention masks (what's visible)
-    - Predicts embeddings at specific target positions
-    - Uses positional information throughout
+    Simple predictor that uses full context to predict target representations.
+    
+    Uses mean-pooling of context to predict each target position.
+    In a more sophisticated version, you'd use cross-attention from targets to context.
     """
 
-    def __init__(self, context_encoder, target_predictor, use_predictor_head=True):
+    def __init__(self, hidden_dim):
         super().__init__()
-        self.context_encoder = context_encoder
-        self.use_predictor_head = use_predictor_head
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
 
-        if use_predictor_head:
-            hidden_size = CONTEXT_ENCODER_CONFIG["hidden_size"]
-            self.predictor_head = PredictorHead(
-                input_dim=hidden_size,
-                hidden_dim=hidden_size * 2,
-                output_dim=hidden_size
-            )
-        else:
-            self.target_predictor = target_predictor
-
-    def forward(self, token_ids, context_mask, target_mask):
+    def forward(self, context_repr, target_mask):
         """
-        I-JEPA forward pass with attention masking.
-
         Args:
-            token_ids: Tensor of shape (batch, seq_len) - full sequence
-            context_mask: Boolean tensor (batch, seq_len) - True = can attend
-            target_mask: Boolean tensor (batch, seq_len) - True = predict here
+            context_repr: [B, L, D] - context representations (targets zeroed out)
+            target_mask: [B, L] - 1 where to predict
 
         Returns:
-            predictions: Tensor (batch, num_targets, hidden_dim)
-            target_positions: Tensor (batch, num_targets) - indices of target positions
+            predictions: [B, num_targets, D]
         """
-        batch_size, seq_len = token_ids.shape
+        B, L, D = context_repr.shape
+        device = context_repr.device
 
-        # Encode with context mask (model only attends to context positions)
-        # Note: attention_mask convention: 1 = attend, 0 = don't attend
-        attention_mask = context_mask.long()
+        # Find max number of targets
+        num_targets = int(target_mask.sum(dim=1).max().item())
 
-        outputs = self.context_encoder.model(
-            input_ids=token_ids,
-            attention_mask=attention_mask
-        )
-        encoded = outputs.last_hidden_state  # (batch, seq_len, hidden_dim)
+        if num_targets == 0:
+            return torch.zeros(B, 1, D, device=device)
 
-        # Extract embeddings at target positions
-        predictions = []
-        target_positions = []
+        predictions = torch.zeros(B, num_targets, D, device=device)
 
-        for i in range(batch_size):
-            # Get indices where target_mask is True
-            tgt_indices = torch.where(target_mask[i])[0]  # (num_targets,)
+        # For each sample, use full context to predict at target positions
+        for i in range(B):
+            target_indices = torch.where(target_mask[i] == 1)[0]
+            num_tgt = len(target_indices)
 
-            if len(tgt_indices) > 0:
-                # Get embeddings at those positions
-                # (num_targets, hidden_dim)
-                tgt_embeds = encoded[i, tgt_indices, :]
-
-                if self.use_predictor_head:
-                    # Predict target representations
-                    # (num_targets, hidden_dim)
-                    pred = self.predictor_head(tgt_embeds)
+            if num_tgt > 0:
+                # Mean-pool over context (non-zero positions)
+                # context_repr[i] has zeros at target positions
+                # Sum over context positions and divide by number of context positions
+                context_sum = context_repr[i].sum(dim=0)  # [D]
+                num_context = (context_repr[i].abs().sum(dim=-1) > 0).sum()  # Count non-zero positions
+                
+                if num_context > 0:
+                    context_mean = context_sum / num_context  # [D]
                 else:
-                    pred = tgt_embeds
+                    context_mean = torch.zeros(D, device=device)
+                
+                # Predict same representation for all targets (simple baseline)
+                # In practice, you'd want position-specific predictions
+                pred = self.proj(context_mean.unsqueeze(0))  # [1, D]
+                predictions[i, :num_tgt] = pred.expand(num_tgt, -1)  # [num_tgt, D]
 
-                predictions.append(pred)
-                target_positions.append(tgt_indices)
-
-        return predictions, target_positions
+        return predictions
 
 
-# Create the trainable model with predictor head
+class TrainableJEPA(nn.Module):
+    """
+    Correct JEPA implementation for text.
+
+    Key: Model encodes FULL sequence with normal attention, but we zero out
+    target regions from the representations, then predict what should be there.
+    """
+
+    def __init__(self, context_encoder, predictor):
+        super().__init__()
+        self.context_encoder = context_encoder
+        self.predictor = predictor
+
+    def forward(self, input_ids, attention_mask, context_mask, target_mask):
+        """
+        JEPA forward pass.
+
+        Args:
+            input_ids: [B, L] - Full tokenized sequence
+            attention_mask: [B, L] - 1 for real tokens, 0 for padding
+            context_mask: [B, L] - 1 for visible positions, 0 for masked
+            target_mask: [B, L] - 1 for positions to predict, 0 otherwise
+
+        Returns:
+            predicted_targets: [B, num_targets, D] - Predicted representations
+        """
+        # Encode full sequence with normal attention (respects padding)
+        encoder_output = self.context_encoder.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask  # Only masks padding, not targets!
+        )
+        full_repr = encoder_output.last_hidden_state  # [B, L, D]
+
+        # Zero out target regions (model shouldn't use info from targets)
+        context_repr = full_repr * context_mask.unsqueeze(-1)  # [B, L, D]
+
+        # Predict at target positions
+        predicted_targets = self.predictor(context_repr, target_mask)
+
+        return predicted_targets
+
+
+# Create the predictor and trainable model
+hidden_size = CONTEXT_ENCODER_CONFIG["hidden_size"]
+predictor = SimplePredictor(hidden_dim=hidden_size)
+
 trainable = TrainableJEPA(
-    context_encoder, target_predictor, use_predictor_head=True)
+    context_encoder=context_encoder,
+    predictor=predictor
+)
 
 # ----------------------------
 # DeepSpeed initialize (ZeRO-3)
@@ -450,72 +501,123 @@ logi("Components built and sharded successfully.")
 logi("Starting training loop...")
 
 # ----------------------------
-# Training loop (I-JEPA style with attention masking)
+# Helper function to extract target representations
+# ----------------------------
+
+
+def extract_target_representations(representations, target_mask):
+    """
+    Extract representations at target positions.
+
+    Args:
+        representations: [B, L, D]
+        target_mask: [B, L] - 1 where targets are
+
+    Returns:
+        targets: [B, num_targets, D]
+    """
+    B, L, D = representations.shape
+    device = representations.device
+
+    num_targets = int(target_mask.sum(dim=1).max().item())
+
+    if num_targets == 0:
+        return torch.zeros(B, 1, D, device=device)
+
+    targets = torch.zeros(B, num_targets, D, device=device)
+
+    for i in range(B):
+        target_indices = torch.where(target_mask[i] == 1)[0]
+        num_tgt = len(target_indices)
+        if num_tgt > 0:
+            targets[i, :num_tgt] = representations[i, target_indices]
+
+    return targets
+
+
+# ----------------------------
+# Training loop (Batched processing with tensor-based masks)
 # ----------------------------
 engine.train()
 for patch_batch in dataloader:
     engine.zero_grad()
     patch_batch = to_device(patch_batch)
 
+    # Process FULL BATCH at once (not one sequence at a time!)
+    batch_token_ids = []
+    max_len = 0
+
     for patches in patch_batch:
-        # patches is a list of tokens (strings)
         if len(patches) == 0:
             continue
-
-        seq_len = len(patches)
-
-        # Get context and target masks (numpy arrays of shape (seq_len,))
-        context_mask_np, target_masks_np = context_target_creator.create_context_and_targets(
-            seq_len)
-
-        # Convert tokens to IDs
         token_ids = tokenizer.convert_tokens_to_ids(patches)
-        token_ids_tensor = torch.tensor(
-            [token_ids], device=device)  # (1, seq_len)
+        batch_token_ids.append(token_ids)
+        max_len = max(max_len, len(token_ids))
 
-        # Convert masks to tensors
-        context_mask_tensor = torch.from_numpy(
-            context_mask_np).bool().unsqueeze(0).to(device)  # (1, seq_len)
-        target_mask_tensor = torch.from_numpy(
-            target_masks_np[0]).bool().unsqueeze(0).to(device)  # (1, seq_len)
+    if len(batch_token_ids) == 0:
+        continue
 
-        # Forward pass: predict embeddings at target positions using context
-        predictions, target_positions = engine(
-            token_ids_tensor, context_mask_tensor, target_mask_tensor)
+    # Pad sequences to same length
+    padded_ids = []
+    attention_masks = []
 
-        # Get ground truth embeddings at target positions from EMA encoder
-        with torch.no_grad():
-            # Encode full sequence with target encoder (no masking)
-            full_attention_mask = torch.ones_like(token_ids_tensor)
-            target_outputs = target_encoder.model(
-                input_ids=token_ids_tensor,
-                attention_mask=full_attention_mask
-            )
-            # (1, seq_len, hidden_dim)
-            target_embeds_full = target_outputs.last_hidden_state
+    for token_ids in batch_token_ids:
+        pad_len = max_len - len(token_ids)
+        padded = token_ids + [tokenizer.pad_token_id] * pad_len
+        attn_mask = [1] * len(token_ids) + [0] * pad_len
 
-            # Extract embeddings at target positions
-            target_embeds = []
-            for i in range(len(predictions)):
-                tgt_pos = target_positions[i]
-                tgt_embeds_at_pos = target_embeds_full[i, tgt_pos, :]
-                target_embeds.append(tgt_embeds_at_pos)
+        padded_ids.append(padded)
+        attention_masks.append(attn_mask)
 
-        # Compute loss: compare predicted vs ground truth embeddings at target positions
-        # For now, just use the first batch item (batch_size=1 in the inner loop)
-        if len(predictions) > 0 and len(target_embeds) > 0:
-            pred = predictions[0]  # (num_targets, hidden_dim)
-            target = target_embeds[0]  # (num_targets, hidden_dim)
+    # Convert to tensors
+    input_ids = torch.tensor(padded_ids, device=device)  # [B, L]
+    attention_mask = torch.tensor(
+        attention_masks, device=device).float()  # [B, L]
 
-            # Simple MSE loss
-            loss = torch.nn.functional.mse_loss(pred, target)
+    # STEP 1: Create context and target masks
+    mask_pair = context_target_creator.create_context_and_targets(
+        input_ids=input_ids,
+        attention_mask=attention_mask
+    )
 
-            engine.backward(loss)
-            engine.step()
-            target_encoder.update()
+    context_mask = mask_pair.context_mask  # [B, L]
+    target_mask = mask_pair.target_masks[0]  # [B, L]
 
-            if RANK == 0:
-                logger.info(
-                    f"Loss: {float(loss.detach().cpu()):.6f} | Num targets: {len(target_positions[0])}")
+    # STEP 2: Forward pass - predict target representations
+    predicted_targets = engine(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        context_mask=context_mask,
+        target_mask=target_mask
+    )  # [B, num_targets, D]
+
+    # STEP 3: Get ground truth target representations (no gradients)
+    with torch.no_grad():
+        target_output = target_encoder.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        full_target_repr = target_output.last_hidden_state  # [B, L, D]
+
+        # Extract at target positions
+        actual_targets = extract_target_representations(
+            full_target_repr,
+            target_mask
+        )  # [B, num_targets, D]
+
+    # STEP 4: Compute loss
+    loss = loss_calculator(predicted_targets, actual_targets)
+
+    # STEP 5: Backward and optimize
+    engine.backward(loss)
+    engine.step()
+
+    # STEP 6: Update EMA (once per batch!)
+    target_encoder.update()
+
+    if RANK == 0:
+        num_targets = int(target_mask.sum().item())
+        logger.info(
+            f"Loss: {loss.item():.6f} | Batch size: {input_ids.shape[0]} | Total targets: {num_targets}")
 
 logi("Training loop finished.")

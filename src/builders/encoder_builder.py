@@ -1,10 +1,15 @@
 from src.builders.base_builder import EnumBuilder
 from enum import Enum
+from typing import Literal
 from src.encoders.context_encoders.longformer import Longformer
 
 
 class EncodingStrategy(Enum):
     longformer = Longformer
+
+
+# Type for configuration
+EncoderType = Literal["longformer"]
 
 
 class encoder_builder(EnumBuilder[EncodingStrategy]):

@@ -1,5 +1,6 @@
 from src.builders.base_builder import EnumBuilder
 from enum import Enum
+from typing import Literal
 
 
 class TokenPatcher:
@@ -12,6 +13,10 @@ class TokenPatcher:
 
 class PatchStrategy(Enum):
     token = TokenPatcher
+
+
+# Type for configuration
+PatchStrategyType = Literal["token"]
 
 
 class patcher_builder(EnumBuilder[PatchStrategy]):

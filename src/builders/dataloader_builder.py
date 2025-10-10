@@ -1,5 +1,6 @@
 from src.builders.base_builder import EnumBuilder
 from enum import Enum
+from typing import Literal
 from src.dataloaders.recipe1m_dataloader import RecipeDataloader
 from src.dataloaders.dolma_sample_dataloader import DolmaSampleDataloader
 
@@ -7,6 +8,10 @@ from src.dataloaders.dolma_sample_dataloader import DolmaSampleDataloader
 class Dataset(Enum):
     recipe = RecipeDataloader
     dolma_sample = DolmaSampleDataloader
+
+
+# Type for configuration
+DatasetType = Literal["recipe", "dolma_sample"]
 
 
 class dataloader_builder(EnumBuilder[Dataset]):

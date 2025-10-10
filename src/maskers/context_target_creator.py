@@ -1,68 +1,107 @@
-from typing import List, Tuple
-import numpy as np
-from src.maskers.base import BaseMaskingStrategy
+"""
+Context-Target creator for JEPA-style training.
+
+This module creates context and target masks using separate strategies.
+Supports both complementary (no overlap) and flexible (can overlap) masking.
+"""
+
+import torch
+from typing import List
+from dataclasses import dataclass
+from src.maskers.base_mask_generator import BaseMaskGenerator
+
+
+@dataclass
+class ContextTargetPair:
+    """Container for context and target masks."""
+    context_mask: torch.Tensor  # [B, L] - 1 for visible, 0 for masked
+    # List of [B, L] - 1 for predict, 0 for ignore
+    target_masks: List[torch.Tensor]
+    num_targets: int
 
 
 class ContextTargetCreator:
     """
-    Creates context and target masks for self-supervised learning.
+    Creates context and target masks for JEPA training using separate generators.
 
-    This class uses masking strategies to generate one context mask and
-    multiple target masks for a given sequence of patches.
+    Key principles:
+    1. Works with batched torch tensors
+    2. Uses separate generators for context and targets (flexible, can overlap)
+    3. Context = what model can see
+    4. Targets = what model must predict
+
+    Note: Context and targets CAN overlap with this design. If you need guaranteed
+    disjoint masks, use the same generator for both and set num_targets=1.
     """
 
     def __init__(
         self,
-        context_strategy: BaseMaskingStrategy,
-        target_strategy: BaseMaskingStrategy,
-        num_targets: int,
+        context_generator: BaseMaskGenerator,
+        target_generator: BaseMaskGenerator,
+        num_targets: int = 1
     ):
         """
         Initialize the ContextTargetCreator.
 
         Args:
-            context_strategy: Masking strategy for creating the context mask
-            target_strategy: Masking strategy for creating target masks
+            context_generator: Generator for creating context masks
+            target_generator: Generator for creating target masks
             num_targets: Number of target masks to generate
         """
-        self.context_strategy = context_strategy
-        self.target_strategy = target_strategy
+        self.context_generator = context_generator
+        self.target_generator = target_generator
         self.num_targets = num_targets
 
     def create_context_and_targets(
-        self, sequence_length: int
-    ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None
+    ) -> ContextTargetPair:
         """
-        Create one context mask and multiple target masks for I-JEPA style learning.
-        
-        For I-JEPA: context_mask indicates which positions the model can see (attend to),
-        and target_masks indicate which positions to predict embeddings for.
+        Create context and target masks using separate generators.
 
         Args:
-            sequence_length: Length of the input sequence
+            input_ids: [B, L] - Tokenized sequences (batch of sequences)
+            attention_mask: [B, L] - Optional mask (1 for real tokens, 0 for padding)
 
         Returns:
-            Tuple containing:
-                - context_mask (np.ndarray): Boolean mask (shape: sequence_length) for context positions
-                - target_masks (List[np.ndarray]): List of boolean masks for target positions
+            ContextTargetPair with:
+                - context_mask: [B, L] - 1 = visible to model, 0 = hidden
+                - target_masks: List of [B, L] - 1 = predict this position, 0 = don't predict
 
-        Example:
-            >>> creator = ContextTargetCreator(
-            ...     context_strategy=RandomMasker(mask_ratio=0.6),
-            ...     target_strategy=BlockMasker(span_length=10),
-            ...     num_targets=4
-            ... )
-            >>> context_mask, target_masks = creator.create_context_and_targets(100)
-            >>> # context_mask[i] = True means position i is visible to the model
-            >>> # target_masks[0][j] = True means predict embedding at position j
+        Note: Masks are independently generated and MAY OVERLAP!
+        Overlap means: context_mask[i,j] = 1 AND target_mask[i,j] = 1
+        → Position j is both visible AND being predicted (data leakage in JEPA!)
+        
+        To avoid overlap, ensure context and target generators select disjoint regions.
         """
-        # Create context mask using context strategy
-        context_mask = self.context_strategy.create_mask(sequence_length)
+        B, L = input_ids.shape
+        device = input_ids.device
 
-        # Create target masks using target strategy
+        if attention_mask is None:
+            attention_mask = torch.ones(B, L, device=device)
+
+        # Generate context mask (1 = visible, 0 = masked)
+        context_mask = self.context_generator.generate_mask(
+            batch_size=B,
+            seq_length=L,
+            device=device,
+            attention_mask=attention_mask
+        )
+
+        # Generate target masks (1 = predict here, 0 = don't predict)
         target_masks = []
         for _ in range(self.num_targets):
-            target_mask = self.target_strategy.create_mask(sequence_length)
+            target_mask = self.target_generator.generate_mask(
+                batch_size=B,
+                seq_length=L,
+                device=device,
+                attention_mask=attention_mask
+            )
             target_masks.append(target_mask)
 
-        return context_mask, target_masks
+        return ContextTargetPair(
+            context_mask=context_mask,
+            target_masks=target_masks,
+            num_targets=len(target_masks)
+        )
