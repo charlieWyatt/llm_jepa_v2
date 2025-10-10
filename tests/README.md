@@ -60,4 +60,3 @@ poetry run pytest --cov=src --cov-report=html
 - **Edge cases**: Tests include empty inputs, boundary conditions, and error cases
 - **Reproducibility**: Tests use fixed seeds to ensure deterministic behavior
 - **Clear naming**: Test names describe what is being tested
-

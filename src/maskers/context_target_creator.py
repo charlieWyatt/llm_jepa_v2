@@ -1,4 +1,4 @@
-from typing import Any, List, Tuple
+from typing import List, Tuple
 import numpy as np
 from src.maskers.base import BaseMaskingStrategy
 
@@ -30,18 +30,21 @@ class ContextTargetCreator:
         self.num_targets = num_targets
 
     def create_context_and_targets(
-        self, patches: Any
+        self, sequence_length: int
     ) -> Tuple[np.ndarray, List[np.ndarray]]:
         """
-        Create one context mask and multiple target masks.
+        Create one context mask and multiple target masks for I-JEPA style learning.
+        
+        For I-JEPA: context_mask indicates which positions the model can see (attend to),
+        and target_masks indicate which positions to predict embeddings for.
 
         Args:
-            patches: List or array of patches to create masks for
+            sequence_length: Length of the input sequence
 
         Returns:
             Tuple containing:
-                - context_mask (np.ndarray): Boolean mask for context
-                - target_masks (List[np.ndarray]): List of boolean masks for targets
+                - context_mask (np.ndarray): Boolean mask (shape: sequence_length) for context positions
+                - target_masks (List[np.ndarray]): List of boolean masks for target positions
 
         Example:
             >>> creator = ContextTargetCreator(
@@ -49,16 +52,17 @@ class ContextTargetCreator:
             ...     target_strategy=BlockMasker(span_length=10),
             ...     num_targets=4
             ... )
-            >>> context_mask, target_masks = creator.create_context_and_targets(patches)
-            >>> # Each call generates different random masks
+            >>> context_mask, target_masks = creator.create_context_and_targets(100)
+            >>> # context_mask[i] = True means position i is visible to the model
+            >>> # target_masks[0][j] = True means predict embedding at position j
         """
         # Create context mask using context strategy
-        context_mask = self.context_strategy.create_mask(patches)
+        context_mask = self.context_strategy.create_mask(sequence_length)
 
         # Create target masks using target strategy
         target_masks = []
         for _ in range(self.num_targets):
-            target_mask = self.target_strategy.create_mask(patches)
+            target_mask = self.target_strategy.create_mask(sequence_length)
             target_masks.append(target_mask)
 
         return context_mask, target_masks
