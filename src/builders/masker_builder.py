@@ -1,12 +1,12 @@
 from src.builders.base_builder import EnumBuilder
 from enum import Enum
 from src.maskers.random_masker import RandomMasker
-from src.maskers.contiguous_random_masker import ContiguousRandomMasker
+from src.maskers.block_masker import BlockMasker
 
 
 class MaskStrategy(Enum):
     random = RandomMasker
-    contiguous = ContiguousRandomMasker
+    block = BlockMasker
 
 
 class masker_builder(EnumBuilder[MaskStrategy]):

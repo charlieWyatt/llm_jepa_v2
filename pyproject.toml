@@ -16,11 +16,17 @@ datasets = "^3.6.0"
 kfp = "^2.14.2"
 google-cloud-aiplatform = "^1.107.0"
 gcsfs = "2025.3.0"
+deepspeed = "^0.18.0"
 
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.12.0"
+pytest = "^8.0.0"
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.flake8]
+max-line-length = 200
+extend-ignore = ["E203"]

@@ -1,13 +1,10 @@
 # train.py
-import sys, os, logging, math
+import sys
+import os
+import logging
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 import deepspeed
-import math
-
-from contextlib import nullcontext
-from torch.utils.data import DataLoader
 
 from src.builders.dataloader_builder import dataloader_builder
 from src.builders.patcher_builder import patcher_builder
@@ -15,6 +12,7 @@ from src.builders.masker_builder import masker_builder
 from src.builders.encoder_builder import encoder_builder
 from src.encoders.target_encoders.ema_target_encoder import ema_target_encoder
 from src.builders.loss_calculator_builder import loss_calculator_builder
+from src.maskers.context_target_creator import ContextTargetCreator
 from config import STRATEGY_CONSTS
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -35,6 +33,8 @@ logger.setLevel(logging.INFO)
 # ----------------------------
 # DeepSpeed distributed init
 # ----------------------------
+
+
 def init_dist():
     if torch.cuda.is_available():
         try:
@@ -46,16 +46,20 @@ def init_dist():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     return world_size > 1, rank, local_rank, world_size
 
+
 IS_DIST, RANK, LOCAL_RANK, WORLD_SIZE = init_dist()
+
 
 def logi(msg):
     if RANK == 0:
         logger.info(msg)
 
+
 logi("Starting training pipeline setup...")
 logi(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    logger.info(f"GPU[{LOCAL_RANK}]: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+    logger.info(
+        f"GPU[{LOCAL_RANK}]: {torch.cuda.get_device_name(torch.cuda.current_device())}")
 
 # ----------------------------
 # Strategy config (unchanged)
@@ -133,8 +137,15 @@ DS_CONFIG = {
 logi("Building components...")
 loss_calculator = loss_calculator_builder(loss_calculator_type).build()
 
-target_creator = masker_builder(target_mask_strategy).build()
-context_creator = masker_builder(context_mask_strategy).build()
+# Create context-target creator for JEPA-style training
+context_strategy = masker_builder(context_mask_strategy).build()
+target_strategy = masker_builder(target_mask_strategy).build()
+
+context_target_creator = ContextTargetCreator(
+    context_strategy=context_strategy,
+    target_strategy=target_strategy,
+    num_targets=1  # Single target for now (can increase for multi-target JEPA)
+)
 
 # Context encoder (trainable)
 context_encoder = encoder_builder(context_encoder_type).build(
@@ -146,12 +157,14 @@ tokenizer = context_encoder.tokenizer
 # EMA target encoder (non-trainable, updated via .update())
 target_encoder = ema_target_encoder(context_encoder, DEFAULT_EMA_DECAY)
 target_encoder.eval()                 # disable dropout etc.
-for p in target_encoder.parameters(): # belt & suspenders (already in your class)
+for p in target_encoder.parameters():  # belt & suspenders (already in your class)
     p.requires_grad = False
 
 # Patcher & loader
-patcher = patcher_builder(patch_strategy).build(context_encoder, target_encoder)
-dataloader = dataloader_builder(training_dataset).build(patcher, batch_size=BATCH_SIZE)
+patcher = patcher_builder(patch_strategy).build(
+    context_encoder, target_encoder)
+dataloader = dataloader_builder(training_dataset).build(
+    patcher, batch_size=BATCH_SIZE)
 
 # Target predictor (trainable)
 target_predictor = encoder_builder(target_predictor_type).build(
@@ -162,8 +175,11 @@ target_predictor = encoder_builder(target_predictor_type).build(
 # ----------------------------
 # Create a simple predictor head if target_predictor expects embeddings
 # ----------------------------
+
+
 class PredictorHead(nn.Module):
     """Simple MLP head for predicting target representations from combined embeddings"""
+
     def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
         self.net = nn.Sequential(
@@ -172,19 +188,21 @@ class PredictorHead(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, output_dim)
         )
-    
+
     def forward(self, x):
         return self.net(x)
 
 # ----------------------------
 # Wrap trainables in a single module for DeepSpeed
 # ----------------------------
+
+
 class TrainableJEPA(nn.Module):
     def __init__(self, context_encoder, target_predictor, use_predictor_head=True):
         super().__init__()
         self.context_encoder = context_encoder
         self.use_predictor_head = use_predictor_head
-        
+
         if use_predictor_head:
             # Use a simple MLP head instead of the full target_predictor model
             # Adjust dimensions based on your model's hidden size
@@ -200,7 +218,7 @@ class TrainableJEPA(nn.Module):
 
     def forward(self, context, targets, start_tok, end_tok):
         device = next(self.parameters()).device
-        
+
         # Handle the case where context and targets are lists of token strings
         if isinstance(context, list):
             # If it's a list of lists, take the first one for now
@@ -222,34 +240,37 @@ class TrainableJEPA(nn.Module):
 
         # Convert context tokens to tensor if needed and encode directly through model
         if isinstance(context_tokens, list) and all(isinstance(x, str) for x in context_tokens):
-            context_ids = self.context_encoder.tokenizer.convert_tokens_to_ids(context_tokens)
+            context_ids = self.context_encoder.tokenizer.convert_tokens_to_ids(
+                context_tokens)
             context_tensor = torch.tensor([context_ids], device=device)
-            
+
             # Create attention mask (1 for real tokens, 0 for padding)
             attention_mask = torch.ones_like(context_tensor)
-            
+
             # Pass directly to the underlying model, bypassing the tokenizer
             model_inputs = {
                 "input_ids": context_tensor,
                 "attention_mask": attention_mask
             }
-            encoded_context = self.context_encoder.model(**model_inputs).last_hidden_state
+            encoded_context = self.context_encoder.model(
+                **model_inputs).last_hidden_state
         else:
             # If it's already a tensor or different format, handle accordingly
             encoded_context = self.context_encoder(context_tokens)
-        
+
         # Get embeddings for special tokens
         start_emb = self.context_encoder.get_embeddings(start_tok)
         end_emb = self.context_encoder.get_embeddings(end_tok)
-        
+
         predicted_targets = []
         for target_tokens in target_token_lists:
             # Convert target tokens to embeddings
             tgt_emb = self.context_encoder.get_embeddings(target_tokens)
-            
+
             # Concatenate embeddings along sequence dimension
-            combined = torch.cat([start_emb, encoded_context, end_emb, tgt_emb], dim=1)
-            
+            combined = torch.cat(
+                [start_emb, encoded_context, end_emb, tgt_emb], dim=1)
+
             if self.use_predictor_head:
                 # Use MLP head on the combined embeddings
                 # Take mean pooling across sequence dimension for a fixed-size representation
@@ -259,24 +280,30 @@ class TrainableJEPA(nn.Module):
                 # If your target_predictor can handle embeddings directly, use it
                 # Otherwise, you'll need to adapt this part based on your specific predictor
                 pred = self.target_predictor(combined)
-            
+
             predicted_targets.append(pred)
-            
+
         return encoded_context, predicted_targets
 
+
 # Create the trainable model with predictor head
-trainable = TrainableJEPA(context_encoder, target_predictor, use_predictor_head=True)
+trainable = TrainableJEPA(
+    context_encoder, target_predictor, use_predictor_head=True)
 
 # ----------------------------
 # DeepSpeed initialize (ZeRO-3)
 # ----------------------------
 model_parameters = [p for p in trainable.parameters() if p.requires_grad]
+
+
 def _sum_params_module(module, trainable_only=False):
     return sum(p.numel() for p in module.parameters() if (p.requires_grad or not trainable_only))
 
+
 pre_total_all = _sum_params_module(trainable, trainable_only=False)
 pre_total_trn = _sum_params_module(trainable, trainable_only=True)
-pre_global_numels = {name: p.numel() for name, p in trainable.named_parameters()}
+pre_global_numels = {name: p.numel()
+                     for name, p in trainable.named_parameters()}
 
 if RANK == 0:
     logi(f"[pre-shard] total params (all): {pre_total_all:,}")
@@ -284,7 +311,7 @@ if RANK == 0:
 
 engine, optimizer, _, _ = deepspeed.initialize(
     model=trainable,
-    model_parameters=model_parameters,
+    model_parameters=model_parameters,  # type: ignore[arg-type]
     config=DS_CONFIG,
 )
 
@@ -296,7 +323,8 @@ except Exception:
     zero_on = False
     zero_stage = None
 
-logi(f"DeepSpeed ZeRO enabled: {zero_on}, stage: {zero_stage}, dp_world_size: {getattr(engine, 'dp_world_size', WORLD_SIZE)}")
+logi(
+    f"DeepSpeed ZeRO enabled: {zero_on}, stage: {zero_stage}, dp_world_size: {getattr(engine, 'dp_world_size', WORLD_SIZE)}")
 assert zero_on and zero_stage == 3, f"Expected ZeRO stage 3, got: {zero_stage}"
 
 # ----------------------------
@@ -304,8 +332,11 @@ assert zero_on and zero_stage == 3, f"Expected ZeRO stage 3, got: {zero_stage}"
 # ----------------------------
 device = engine.device if torch.cuda.is_available() else torch.device("cpu")
 
-start_tok_tensor = tokenizer.encode(START_OF_CONTEXT_TOKEN, return_tensors="pt").to(device)
-end_tok_tensor = tokenizer.encode(END_OF_CONTEXT_TOKEN, return_tensors="pt").to(device)
+start_tok_tensor = tokenizer.encode(
+    START_OF_CONTEXT_TOKEN, return_tensors="pt").to(device)
+end_tok_tensor = tokenizer.encode(
+    END_OF_CONTEXT_TOKEN, return_tensors="pt").to(device)
+
 
 def to_device(x):
     if torch.is_tensor(x):
@@ -315,6 +346,7 @@ def to_device(x):
     if isinstance(x, (list, tuple)):
         return type(x)(to_device(v) for v in x)
     return x
+
 
 if hasattr(loss_calculator, "to"):
     loss_calculator = loss_calculator.to(device)
@@ -331,6 +363,7 @@ except Exception:
 # Parameter shard stats (after sharding)
 # ----------------------------
 
+
 def _local_shard_numel(engine, module):
     """Count *this rank's* parameter shard numel. Uses DeepSpeed ds_tensor if present."""
     local = 0
@@ -342,6 +375,7 @@ def _local_shard_numel(engine, module):
             local += int(p.numel())
     return local
 
+
 def _local_shard_bytes(engine, module):
     """Exact bytes for this rank's param shards (accounts for mixed dtypes)."""
     total_bytes = 0
@@ -351,17 +385,21 @@ def _local_shard_bytes(engine, module):
         total_bytes += n * p.element_size()
     return total_bytes
 
+
 def _all_gather_i64(value, device):
     """All-gather a single int64 from each rank; returns Python ints."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         t = torch.tensor([int(value)], dtype=torch.long, device=device)
-        outs = [torch.zeros_like(t) for _ in range(torch.distributed.get_world_size())]
+        outs = [torch.zeros_like(t) for _ in range(
+            torch.distributed.get_world_size())]
         torch.distributed.all_gather(outs, t)
         return [int(x.item()) for x in outs]
     return [int(value)]
 
+
 def _fmt_gb(bytes_val):
     return f"{bytes_val / (1024**3):.2f} GB"
+
 
 def log_param_distribution_and_size(engine, device, rank, world_size):
     """Log global param count + each GPU's share (%) and bytes of its shard."""
@@ -369,17 +407,19 @@ def log_param_distribution_and_size(engine, device, rank, world_size):
     local_bytes = _local_shard_bytes(engine, engine.module)
 
     shard_numels = _all_gather_i64(local_numel, device)
-    shard_bytes  = _all_gather_i64(local_bytes, device)
+    shard_bytes = _all_gather_i64(local_bytes, device)
 
     global_numel = sum(shard_numels)
     global_bytes = sum(shard_bytes)
 
     if rank == 0:
-        logger.info(f"[post-shard] global params: {global_numel:,}  (~{_fmt_gb(global_bytes)} across all shards)")
+        logger.info(
+            f"[post-shard] global params: {global_numel:,}  (~{_fmt_gb(global_bytes)} across all shards)")
         for r in range(len(shard_numels)):
             pct = 100.0 * shard_numels[r] / max(global_numel, 1)
             logger.info(f"GPU {r+1} (rank {r}): ~{shard_numels[r]:,} params "
                         f"({pct:.2f}%), shard size ≈ {_fmt_gb(shard_bytes[r])}")
+
 
 def log_gpu_memory_snapshot(tag, rank):
     """Log per-GPU memory (global device view) + this process's PyTorch alloc/reserved."""
@@ -397,6 +437,7 @@ def log_gpu_memory_snapshot(tag, rank):
             f"  GPU {i+1}: used { _fmt_gb(used_b) } / total { _fmt_gb(total_b) } | "
             f"PyTorch alloc { _fmt_gb(alloc_b) }, reserved { _fmt_gb(reserv_b) }"
         )
+
 
 def log_first_local_params(engine, rank, max_items=10):
     """
@@ -418,7 +459,9 @@ def log_first_local_params(engine, rank, max_items=10):
                 break
 
     if shown == 0:
-        logger.info(f"[rank {rank}] no local param shards found (unexpected for ZeRO-3).")
+        logger.info(
+            f"[rank {rank}] no local param shards found (unexpected for ZeRO-3).")
+
 
 log_param_distribution_and_size(engine, device, RANK, WORLD_SIZE)
 log_gpu_memory_snapshot("post-init-models", RANK)
@@ -437,13 +480,20 @@ for patch_batch in dataloader:
     patch_batch = to_device(patch_batch)
 
     for patches in patch_batch:
-        targets = target_creator.create_spans(patches)
-        context = context_creator.create_spans(patches)
+        # Get context and target masks
+        context_mask, target_masks = context_target_creator.create_context_and_targets(
+            patches)
+
+        # Apply masks to get actual tokens
+        context = [p for p, m in zip(patches, context_mask) if m]
+        # Use first target
+        targets = [p for p, m in zip(patches, target_masks[0]) if m]
 
         targets = to_device(targets)
         context = to_device(context)
 
-        encoded_context, predicted_targets = engine(context, targets, start_tok_tensor, end_tok_tensor)
+        encoded_context, predicted_targets = engine(
+            context, targets, start_tok_tensor, end_tok_tensor)
         with torch.no_grad():
             encoded_target = target_encoder(patches)
         loss = loss_calculator(encoded_target, predicted_targets)
