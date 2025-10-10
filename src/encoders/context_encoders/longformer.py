@@ -40,6 +40,22 @@ class Longformer(ContextEncoder):
     def tokenizer(self):
         return self._tokenizer
 
+    def get_embeddings(self, input_data):
+        """Get word embeddings for token IDs, text strings, or lists of token strings."""
+        device = next(self.model.parameters()).device
+        
+        if isinstance(input_data, list) and all(isinstance(x, str) for x in input_data):
+            # Convert list of token strings to tensor of token IDs
+            token_ids = torch.tensor([self.tokenizer.convert_tokens_to_ids(input_data)], device=device)
+        elif isinstance(input_data, str):
+            # Single string - tokenize it
+            token_ids = self.tokenizer.encode(input_data, return_tensors="pt").to(device)
+        else:
+            # Assume it's already token IDs
+            token_ids = input_data.to(device) if hasattr(input_data, 'to') else torch.tensor(input_data, device=device)
+        
+        return self.model.embeddings.word_embeddings(token_ids)
+
     def forward(self, input_texts):
         inputs = self.tokenizer(
             input_texts,

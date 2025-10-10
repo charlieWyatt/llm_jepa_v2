@@ -75,12 +75,12 @@ logi(f"Context encoder type: {context_encoder_type}")
 START_OF_CONTEXT_TOKEN = "<SOC>"
 END_OF_CONTEXT_TOKEN = "<EOT>"
 DEFAULT_EMA_DECAY = 0.99
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 
 CONTEXT_ENCODER_CONFIG = {
     "hidden_size": 384,
     "num_layers": 6,
-    "attention_window": 256,
+    "attention_window": 128,
 }
 TARGET_ENCODER_CONFIG = {
     "hidden_size": 384,
@@ -100,7 +100,7 @@ has_bf16 = (
 DS_CONFIG = {
     "train_batch_size": BATCH_SIZE,
     "train_micro_batch_size_per_gpu": 1,   # ↓ from 2
-    "gradient_accumulation_steps": 2,      # keep global batch size similar
+    "gradient_accumulation_steps": 1,      # keep global batch size similar
     "bf16": {"enabled": bool(has_bf16)},
     "fp16": {"enabled": not bool(has_bf16)},
     "zero_optimization": {
@@ -160,23 +160,112 @@ target_predictor = encoder_builder(target_predictor_type).build(
 )
 
 # ----------------------------
+# Create a simple predictor head if target_predictor expects embeddings
+# ----------------------------
+class PredictorHead(nn.Module):
+    """Simple MLP head for predicting target representations from combined embeddings"""
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+# ----------------------------
 # Wrap trainables in a single module for DeepSpeed
 # ----------------------------
 class TrainableJEPA(nn.Module):
-    def __init__(self, context_encoder, target_predictor):
+    def __init__(self, context_encoder, target_predictor, use_predictor_head=True):
         super().__init__()
         self.context_encoder = context_encoder
-        self.target_predictor = target_predictor
+        self.use_predictor_head = use_predictor_head
+        
+        if use_predictor_head:
+            # Use a simple MLP head instead of the full target_predictor model
+            # Adjust dimensions based on your model's hidden size
+            hidden_size = CONTEXT_ENCODER_CONFIG["hidden_size"]
+            self.predictor_head = PredictorHead(
+                input_dim=hidden_size,  # Size of combined embeddings
+                hidden_dim=hidden_size * 2,
+                output_dim=hidden_size  # Should match target encoder output dim
+            )
+        else:
+            # If target_predictor can handle embeddings directly
+            self.target_predictor = target_predictor
 
     def forward(self, context, targets, start_tok, end_tok):
-        encoded_context = self.context_encoder(context)
+        device = next(self.parameters()).device
+        
+        # Handle the case where context and targets are lists of token strings
+        if isinstance(context, list):
+            # If it's a list of lists, take the first one for now
+            if isinstance(context[0], list):
+                context_tokens = context[0]
+            else:
+                context_tokens = context
+        else:
+            context_tokens = context
+
+        if isinstance(targets, list) and len(targets) > 0:
+            # If it's a list of lists, process each target
+            if isinstance(targets[0], list):
+                target_token_lists = targets
+            else:
+                target_token_lists = [targets]
+        else:
+            target_token_lists = [targets]
+
+        # Convert context tokens to tensor if needed and encode directly through model
+        if isinstance(context_tokens, list) and all(isinstance(x, str) for x in context_tokens):
+            context_ids = self.context_encoder.tokenizer.convert_tokens_to_ids(context_tokens)
+            context_tensor = torch.tensor([context_ids], device=device)
+            
+            # Create attention mask (1 for real tokens, 0 for padding)
+            attention_mask = torch.ones_like(context_tensor)
+            
+            # Pass directly to the underlying model, bypassing the tokenizer
+            model_inputs = {
+                "input_ids": context_tensor,
+                "attention_mask": attention_mask
+            }
+            encoded_context = self.context_encoder.model(**model_inputs).last_hidden_state
+        else:
+            # If it's already a tensor or different format, handle accordingly
+            encoded_context = self.context_encoder(context_tokens)
+        
+        # Get embeddings for special tokens
+        start_emb = self.context_encoder.get_embeddings(start_tok)
+        end_emb = self.context_encoder.get_embeddings(end_tok)
+        
         predicted_targets = []
-        for tgt in targets:
-            pred = self.target_predictor(start_tok + encoded_context + end_tok + tgt)
+        for target_tokens in target_token_lists:
+            # Convert target tokens to embeddings
+            tgt_emb = self.context_encoder.get_embeddings(target_tokens)
+            
+            # Concatenate embeddings along sequence dimension
+            combined = torch.cat([start_emb, encoded_context, end_emb, tgt_emb], dim=1)
+            
+            if self.use_predictor_head:
+                # Use MLP head on the combined embeddings
+                # Take mean pooling across sequence dimension for a fixed-size representation
+                combined_pooled = combined.mean(dim=1, keepdim=True)
+                pred = self.predictor_head(combined_pooled)
+            else:
+                # If your target_predictor can handle embeddings directly, use it
+                # Otherwise, you'll need to adapt this part based on your specific predictor
+                pred = self.target_predictor(combined)
+            
             predicted_targets.append(pred)
+            
         return encoded_context, predicted_targets
 
-trainable = TrainableJEPA(context_encoder, target_predictor)
+# Create the trainable model with predictor head
+trainable = TrainableJEPA(context_encoder, target_predictor, use_predictor_head=True)
 
 # ----------------------------
 # DeepSpeed initialize (ZeRO-3)
@@ -214,6 +303,9 @@ assert zero_on and zero_stage == 3, f"Expected ZeRO stage 3, got: {zero_stage}"
 # Device plumbing
 # ----------------------------
 device = engine.device if torch.cuda.is_available() else torch.device("cpu")
+
+start_tok_tensor = tokenizer.encode(START_OF_CONTEXT_TOKEN, return_tensors="pt").to(device)
+end_tok_tensor = tokenizer.encode(END_OF_CONTEXT_TOKEN, return_tensors="pt").to(device)
 
 def to_device(x):
     if torch.is_tensor(x):
@@ -351,7 +443,7 @@ for patch_batch in dataloader:
         targets = to_device(targets)
         context = to_device(context)
 
-        encoded_context, predicted_targets = engine(context, targets, START_OF_CONTEXT_TOKEN, END_OF_CONTEXT_TOKEN)
+        encoded_context, predicted_targets = engine(context, targets, start_tok_tensor, end_tok_tensor)
         with torch.no_grad():
             encoded_target = target_encoder(patches)
         loss = loss_calculator(encoded_target, predicted_targets)
