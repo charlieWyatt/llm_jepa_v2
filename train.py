@@ -214,7 +214,7 @@ class PredictorHead(nn.Module):
 class SimplePredictor(nn.Module):
     """
     Simple predictor that uses full context to predict target representations.
-    
+
     Uses mean-pooling of context to predict each target position.
     In a more sophisticated version, you'd use cross-attention from targets to context.
     """
@@ -258,17 +258,19 @@ class SimplePredictor(nn.Module):
                 # context_repr[i] has zeros at target positions
                 # Sum over context positions and divide by number of context positions
                 context_sum = context_repr[i].sum(dim=0)  # [D]
-                num_context = (context_repr[i].abs().sum(dim=-1) > 0).sum()  # Count non-zero positions
-                
+                num_context = (context_repr[i].abs().sum(
+                    dim=-1) > 0).sum()  # Count non-zero positions
+
                 if num_context > 0:
                     context_mean = context_sum / num_context  # [D]
                 else:
                     context_mean = torch.zeros(D, device=device)
-                
+
                 # Predict same representation for all targets (simple baseline)
                 # In practice, you'd want position-specific predictions
                 pred = self.proj(context_mean.unsqueeze(0))  # [1, D]
-                predictions[i, :num_tgt] = pred.expand(num_tgt, -1)  # [num_tgt, D]
+                predictions[i, :num_tgt] = pred.expand(
+                    num_tgt, -1)  # [num_tgt, D]
 
         return predictions
 

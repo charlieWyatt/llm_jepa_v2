@@ -72,7 +72,7 @@ class ContextTargetCreator:
         Note: Masks are independently generated and MAY OVERLAP!
         Overlap means: context_mask[i,j] = 1 AND target_mask[i,j] = 1
         → Position j is both visible AND being predicted (data leakage in JEPA!)
-        
+
         To avoid overlap, ensure context and target generators select disjoint regions.
         """
         B, L = input_ids.shape
