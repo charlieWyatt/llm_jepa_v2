@@ -1,12 +1,14 @@
 # train.py
 from src.maskers.block_mask_generator import BlockMaskGenerator
 from src.maskers.random_mask_generator import RandomMaskGenerator
+from src.maskers.utils import extract_target_representations
 import sys
 import os
 import logging
 import torch
 import torch.nn as nn
 import deepspeed
+from typing import Any
 
 from src.builders.dataloader_builder import dataloader_builder
 from src.builders.patcher_builder import patcher_builder
@@ -36,7 +38,13 @@ logger.setLevel(logging.INFO)
 # ----------------------------
 
 
-def init_dist():
+def init_dist() -> tuple[bool, int, int, int]:
+    """
+    Initialize distributed training environment.
+
+    Returns:
+        tuple: (is_distributed, rank, local_rank, world_size)
+    """
     if torch.cuda.is_available():
         try:
             deepspeed.init_distributed(dist_backend="nccl")
@@ -51,7 +59,8 @@ def init_dist():
 IS_DIST, RANK, LOCAL_RANK, WORLD_SIZE = init_dist()
 
 
-def logi(msg):
+def logi(msg: str) -> None:
+    """Log message only on rank 0."""
     if RANK == 0:
         logger.info(msg)
 
@@ -219,7 +228,7 @@ class SimplePredictor(nn.Module):
     In a more sophisticated version, you'd use cross-attention from targets to context.
     """
 
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim: int) -> None:
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
@@ -228,7 +237,7 @@ class SimplePredictor(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
 
-    def forward(self, context_repr, target_mask):
+    def forward(self, context_repr: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
             context_repr: [B, L, D] - context representations (targets zeroed out)
@@ -283,12 +292,18 @@ class TrainableJEPA(nn.Module):
     target regions from the representations, then predict what should be there.
     """
 
-    def __init__(self, context_encoder, predictor):
+    def __init__(self, context_encoder: Any, predictor: nn.Module) -> None:
         super().__init__()
         self.context_encoder = context_encoder
         self.predictor = predictor
 
-    def forward(self, input_ids, attention_mask, context_mask, target_mask):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        context_mask: torch.Tensor,
+        target_mask: torch.Tensor
+    ) -> torch.Tensor:
         """
         JEPA forward pass.
 
@@ -332,7 +347,8 @@ trainable = TrainableJEPA(
 model_parameters = [p for p in trainable.parameters() if p.requires_grad]
 
 
-def _sum_params_module(module, trainable_only=False):
+def _sum_params_module(module: nn.Module, trainable_only: bool = False) -> int:
+    """Count total parameters in a module."""
     return sum(p.numel() for p in module.parameters() if (p.requires_grad or not trainable_only))
 
 
@@ -369,7 +385,16 @@ assert zero_on and zero_stage == 3, f"Expected ZeRO stage 3, got: {zero_stage}"
 device = engine.device if torch.cuda.is_available() else torch.device("cpu")
 
 
-def to_device(x):
+def to_device(x: Any) -> Any:
+    """
+    Recursively move tensors, dicts, lists, or tuples to device.
+
+    Args:
+        x: Input (tensor, dict, list, tuple, or other)
+
+    Returns:
+        Same structure with tensors moved to device
+    """
     if torch.is_tensor(x):
         return x.to(device, non_blocking=True)
     if isinstance(x, dict):
@@ -395,8 +420,19 @@ except Exception:
 # ----------------------------
 
 
-def _local_shard_numel(engine, module):
-    """Count *this rank's* parameter shard numel. Uses DeepSpeed ds_tensor if present."""
+def _local_shard_numel(engine: Any, module: nn.Module) -> int:
+    """
+    Count *this rank's* parameter shard numel.
+
+    Uses DeepSpeed ds_tensor if present.
+
+    Args:
+        engine: DeepSpeed engine
+        module: PyTorch module
+
+    Returns:
+        Number of parameters in this rank's shard
+    """
     local = 0
     for p in module.parameters():
         ds_tensor = getattr(p, "ds_tensor", None)
@@ -407,8 +443,19 @@ def _local_shard_numel(engine, module):
     return local
 
 
-def _local_shard_bytes(engine, module):
-    """Exact bytes for this rank's param shards (accounts for mixed dtypes)."""
+def _local_shard_bytes(engine: Any, module: nn.Module) -> int:
+    """
+    Exact bytes for this rank's param shards.
+
+    Accounts for mixed dtypes.
+
+    Args:
+        engine: DeepSpeed engine
+        module: PyTorch module
+
+    Returns:
+        Total bytes of parameters in this rank's shard
+    """
     total_bytes = 0
     for p in module.parameters():
         ds_tensor = getattr(p, "ds_tensor", None)
@@ -417,8 +464,17 @@ def _local_shard_bytes(engine, module):
     return total_bytes
 
 
-def _all_gather_i64(value, device):
-    """All-gather a single int64 from each rank; returns Python ints."""
+def _all_gather_i64(value: int, device: torch.device) -> list[int]:
+    """
+    All-gather a single int64 from each rank.
+
+    Args:
+        value: Integer value to gather
+        device: Device to create tensors on
+
+    Returns:
+        List of integers from all ranks (or single value if not distributed)
+    """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         t = torch.tensor([int(value)], dtype=torch.long, device=device)
         outs = [torch.zeros_like(t) for _ in range(
@@ -428,12 +484,26 @@ def _all_gather_i64(value, device):
     return [int(value)]
 
 
-def _fmt_gb(bytes_val):
+def _fmt_gb(bytes_val: int) -> str:
+    """Format bytes as GB string."""
     return f"{bytes_val / (1024**3):.2f} GB"
 
 
-def log_param_distribution_and_size(engine, device, rank, world_size):
-    """Log global param count + each GPU's share (%) and bytes of its shard."""
+def log_param_distribution_and_size(
+    engine: Any,
+    device: torch.device,
+    rank: int,
+    world_size: int
+) -> None:
+    """
+    Log global param count + each GPU's share (%) and bytes of its shard.
+
+    Args:
+        engine: DeepSpeed engine
+        device: Device for tensor operations
+        rank: Current process rank
+        world_size: Total number of processes
+    """
     local_numel = _local_shard_numel(engine, engine.module)
     local_bytes = _local_shard_bytes(engine, engine.module)
 
@@ -452,8 +522,14 @@ def log_param_distribution_and_size(engine, device, rank, world_size):
                         f"({pct:.2f}%), shard size ≈ {_fmt_gb(shard_bytes[r])}")
 
 
-def log_gpu_memory_snapshot(tag, rank):
-    """Log per-GPU memory (global device view) + this process's PyTorch alloc/reserved."""
+def log_gpu_memory_snapshot(tag: str, rank: int) -> None:
+    """
+    Log per-GPU memory (global device view) + this process's PyTorch alloc/reserved.
+
+    Args:
+        tag: Label for this memory snapshot
+        rank: Current process rank
+    """
     if rank != 0 or not torch.cuda.is_available():
         return
     logger.info(f"[{tag}] GPU memory snapshot (pre-data)")
@@ -470,10 +546,16 @@ def log_gpu_memory_snapshot(tag, rank):
         )
 
 
-def log_first_local_params(engine, rank, max_items=10):
+def log_first_local_params(engine: Any, rank: int, max_items: int = 10) -> None:
     """
     Print the first `max_items` parameters *sharded to this rank*.
+
     Uses DeepSpeed's per-param ds_tensor to report the local shard size.
+
+    Args:
+        engine: DeepSpeed engine
+        rank: Current process rank
+        max_items: Maximum number of parameters to log
     """
     shown = 0
     for name, p in engine.module.named_parameters():
@@ -501,40 +583,6 @@ logger.info("Components built and sharded successfully.")
 
 logi("Components built and sharded successfully.")
 logi("Starting training loop...")
-
-# ----------------------------
-# Helper function to extract target representations
-# ----------------------------
-
-
-def extract_target_representations(representations, target_mask):
-    """
-    Extract representations at target positions.
-
-    Args:
-        representations: [B, L, D]
-        target_mask: [B, L] - 1 where targets are
-
-    Returns:
-        targets: [B, num_targets, D]
-    """
-    B, L, D = representations.shape
-    device = representations.device
-
-    num_targets = int(target_mask.sum(dim=1).max().item())
-
-    if num_targets == 0:
-        return torch.zeros(B, 1, D, device=device)
-
-    targets = torch.zeros(B, num_targets, D, device=device)
-
-    for i in range(B):
-        target_indices = torch.where(target_mask[i] == 1)[0]
-        num_tgt = len(target_indices)
-        if num_tgt > 0:
-            targets[i, :num_tgt] = representations[i, target_indices]
-
-    return targets
 
 
 # ----------------------------
