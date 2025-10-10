@@ -10,7 +10,7 @@ class BlockMasker(BaseMaskingStrategy):
     def create_mask(self, sequence_length: int) -> np.ndarray:
         """
         Create a contiguous block mask for a sequence.
-        
+
         Generates a different block position each time (non-deterministic).
 
         Args:

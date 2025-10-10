@@ -202,6 +202,7 @@ class TrainableJEPA(nn.Module):
     - Predicts embeddings at specific target positions
     - Uses positional information throughout
     """
+
     def __init__(self, context_encoder, target_predictor, use_predictor_head=True):
         super().__init__()
         self.context_encoder = context_encoder
@@ -220,49 +221,51 @@ class TrainableJEPA(nn.Module):
     def forward(self, token_ids, context_mask, target_mask):
         """
         I-JEPA forward pass with attention masking.
-        
+
         Args:
             token_ids: Tensor of shape (batch, seq_len) - full sequence
             context_mask: Boolean tensor (batch, seq_len) - True = can attend
             target_mask: Boolean tensor (batch, seq_len) - True = predict here
-            
+
         Returns:
             predictions: Tensor (batch, num_targets, hidden_dim)
             target_positions: Tensor (batch, num_targets) - indices of target positions
         """
         batch_size, seq_len = token_ids.shape
-        
+
         # Encode with context mask (model only attends to context positions)
         # Note: attention_mask convention: 1 = attend, 0 = don't attend
         attention_mask = context_mask.long()
-        
+
         outputs = self.context_encoder.model(
             input_ids=token_ids,
             attention_mask=attention_mask
         )
         encoded = outputs.last_hidden_state  # (batch, seq_len, hidden_dim)
-        
+
         # Extract embeddings at target positions
         predictions = []
         target_positions = []
-        
+
         for i in range(batch_size):
             # Get indices where target_mask is True
             tgt_indices = torch.where(target_mask[i])[0]  # (num_targets,)
-            
+
             if len(tgt_indices) > 0:
                 # Get embeddings at those positions
-                tgt_embeds = encoded[i, tgt_indices, :]  # (num_targets, hidden_dim)
-                
+                # (num_targets, hidden_dim)
+                tgt_embeds = encoded[i, tgt_indices, :]
+
                 if self.use_predictor_head:
                     # Predict target representations
-                    pred = self.predictor_head(tgt_embeds)  # (num_targets, hidden_dim)
+                    # (num_targets, hidden_dim)
+                    pred = self.predictor_head(tgt_embeds)
                 else:
                     pred = tgt_embeds
-                
+
                 predictions.append(pred)
                 target_positions.append(tgt_indices)
-        
+
         return predictions, target_positions
 
 
@@ -458,23 +461,28 @@ for patch_batch in dataloader:
         # patches is a list of tokens (strings)
         if len(patches) == 0:
             continue
-            
+
         seq_len = len(patches)
-        
+
         # Get context and target masks (numpy arrays of shape (seq_len,))
-        context_mask_np, target_masks_np = context_target_creator.create_context_and_targets(seq_len)
-        
+        context_mask_np, target_masks_np = context_target_creator.create_context_and_targets(
+            seq_len)
+
         # Convert tokens to IDs
         token_ids = tokenizer.convert_tokens_to_ids(patches)
-        token_ids_tensor = torch.tensor([token_ids], device=device)  # (1, seq_len)
-        
+        token_ids_tensor = torch.tensor(
+            [token_ids], device=device)  # (1, seq_len)
+
         # Convert masks to tensors
-        context_mask_tensor = torch.from_numpy(context_mask_np).bool().unsqueeze(0).to(device)  # (1, seq_len)
-        target_mask_tensor = torch.from_numpy(target_masks_np[0]).bool().unsqueeze(0).to(device)  # (1, seq_len)
-        
+        context_mask_tensor = torch.from_numpy(
+            context_mask_np).bool().unsqueeze(0).to(device)  # (1, seq_len)
+        target_mask_tensor = torch.from_numpy(
+            target_masks_np[0]).bool().unsqueeze(0).to(device)  # (1, seq_len)
+
         # Forward pass: predict embeddings at target positions using context
-        predictions, target_positions = engine(token_ids_tensor, context_mask_tensor, target_mask_tensor)
-        
+        predictions, target_positions = engine(
+            token_ids_tensor, context_mask_tensor, target_mask_tensor)
+
         # Get ground truth embeddings at target positions from EMA encoder
         with torch.no_grad():
             # Encode full sequence with target encoder (no masking)
@@ -483,29 +491,31 @@ for patch_batch in dataloader:
                 input_ids=token_ids_tensor,
                 attention_mask=full_attention_mask
             )
-            target_embeds_full = target_outputs.last_hidden_state  # (1, seq_len, hidden_dim)
-            
+            # (1, seq_len, hidden_dim)
+            target_embeds_full = target_outputs.last_hidden_state
+
             # Extract embeddings at target positions
             target_embeds = []
             for i in range(len(predictions)):
                 tgt_pos = target_positions[i]
                 tgt_embeds_at_pos = target_embeds_full[i, tgt_pos, :]
                 target_embeds.append(tgt_embeds_at_pos)
-        
+
         # Compute loss: compare predicted vs ground truth embeddings at target positions
         # For now, just use the first batch item (batch_size=1 in the inner loop)
         if len(predictions) > 0 and len(target_embeds) > 0:
             pred = predictions[0]  # (num_targets, hidden_dim)
             target = target_embeds[0]  # (num_targets, hidden_dim)
-            
+
             # Simple MSE loss
             loss = torch.nn.functional.mse_loss(pred, target)
-            
+
             engine.backward(loss)
             engine.step()
             target_encoder.update()
 
             if RANK == 0:
-                logger.info(f"Loss: {float(loss.detach().cpu()):.6f} | Num targets: {len(target_positions[0])}")
+                logger.info(
+                    f"Loss: {float(loss.detach().cpu()):.6f} | Num targets: {len(target_positions[0])}")
 
 logi("Training loop finished.")

@@ -10,7 +10,7 @@ class RandomMasker(BaseMaskingStrategy):
     def create_mask(self, sequence_length: int) -> np.ndarray:
         """
         Create a random boolean mask for a sequence.
-        
+
         Generates a different mask each time (non-deterministic).
 
         Args:
