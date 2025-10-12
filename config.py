@@ -17,6 +17,7 @@ class StrategyConfig(TypedDict):
     """Type-safe configuration dictionary."""
     TRAINING_DATASET: DatasetType
     PATCH_STRATEGY: PatchStrategyType
+    PATCH_SIZE: int
     MASK_STRATEGY: MaskStrategyType
     CONTEXT_STRATEGY: MaskStrategyType
     CONTEXT_ENCODER: EncoderType
@@ -28,7 +29,8 @@ class StrategyConfig(TypedDict):
 
 STRATEGY_CONSTS: StrategyConfig = {
     "TRAINING_DATASET": "dolma_sample",
-    "PATCH_STRATEGY": "token",
+    "PATCH_STRATEGY": "mean",  # "mean" or "max" pooling
+    "PATCH_SIZE": 4,  # Number of tokens to aggregate into one patch
     "MASK_STRATEGY": "random",
     "CONTEXT_STRATEGY": "random",
     "CONTEXT_ENCODER": "longformer",

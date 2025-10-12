@@ -1,23 +1,7 @@
 # Tests
 
-This directory contains unit tests for the llm_jepa_v2 project.
-
-## Structure
-
-The test directory mirrors the structure of the `src` directory:
-
-```
-tests/
-├── maskers/
-│   ├── test_random_masker.py
-│   ├── test_block_masker.py
-│   └── test_context_target_creator.py
-└── README.md
-```
 
 ## Running Tests
-
-### Run all tests
 
 ```bash
 poetry run pytest

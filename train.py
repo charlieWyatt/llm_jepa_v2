@@ -8,7 +8,7 @@ import logging
 import torch
 import torch.nn as nn
 import deepspeed
-from typing import Any
+from typing import Any, Tuple
 
 from src.builders.dataloader_builder import dataloader_builder
 from src.builders.patcher_builder import patcher_builder
@@ -76,6 +76,7 @@ if torch.cuda.is_available():
 # ----------------------------
 training_dataset = STRATEGY_CONSTS["TRAINING_DATASET"]
 patch_strategy = STRATEGY_CONSTS["PATCH_STRATEGY"]
+patch_size = STRATEGY_CONSTS["PATCH_SIZE"]
 target_mask_strategy = STRATEGY_CONSTS["MASK_STRATEGY"]
 context_mask_strategy = STRATEGY_CONSTS["CONTEXT_STRATEGY"]
 context_encoder_type = STRATEGY_CONSTS["CONTEXT_ENCODER"]
@@ -84,6 +85,7 @@ loss_calculator_type = STRATEGY_CONSTS["LOSS_CALCULATOR"]
 
 logi(f"Training dataset: {training_dataset}")
 logi(f"Patch strategy: {patch_strategy}")
+logi(f"Patch size: {patch_size}")
 logi(f"Context encoder type: {context_encoder_type}")
 
 DEFAULT_EMA_DECAY = 0.99
@@ -178,16 +180,34 @@ context_encoder = encoder_builder(context_encoder_type).build(
 tokenizer = context_encoder.tokenizer
 
 # EMA target encoder (non-trainable, updated via .update())
-target_encoder = ema_target_encoder(context_encoder, DEFAULT_EMA_DECAY)
+target_encoder: ema_target_encoder = ema_target_encoder(
+    context_encoder, DEFAULT_EMA_DECAY)
 target_encoder.eval()                 # disable dropout etc.
 for p in target_encoder.parameters():  # belt & suspenders (already in your class)
     p.requires_grad = False
 
-# Patcher & loader
-patcher = patcher_builder(patch_strategy).build(
-    context_encoder, target_encoder)
+# Build embedding patcher (I-JEPA style)
+embedding_patcher = patcher_builder(
+    patch_strategy).build(patch_size=patch_size)
+logi(f"Embedding patcher: {embedding_patcher}")
+
+# Simple text tokenizer for dataloader
+
+
+class TextTokenizer:
+    """Tokenizes text into tokens for the dataloader."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def create_patches(self, text: str):
+        """Returns tokenized text (called 'patches' for dataloader compatibility)."""
+        return self.tokenizer.tokenize(text)
+
+
+text_tokenizer = TextTokenizer(tokenizer=context_encoder.tokenizer)
 dataloader = dataloader_builder(training_dataset).build(
-    patcher, batch_size=BATCH_SIZE)
+    text_tokenizer, batch_size=BATCH_SIZE)
 
 # Target predictor (trainable)
 target_predictor = encoder_builder(target_predictor_type).build(
@@ -218,6 +238,55 @@ class PredictorHead(nn.Module):
 # ----------------------------
 # Wrap trainables in a single module for DeepSpeed
 # ----------------------------
+
+
+def create_patched_embeddings(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    embedding_layer: nn.Module,
+    patcher: Any,
+    patch_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Helper function to create a stream of patches from tokens.
+
+    This applies patching right after tokenization, creating patch embeddings
+    that can be used for context/target creation and encoding.
+
+    Args:
+        input_ids: [B, L] - Token IDs
+        attention_mask: [B, L] - Attention mask (1 for real tokens, 0 for padding)
+        embedding_layer: Token embedding layer from the model
+        patcher: Patcher instance (MeanPatcher or MaxPatcher)
+        patch_size: Size of each patch
+
+    Returns:
+        patched_embeddings: [B, L//patch_size, D] - Patched token embeddings
+        patched_attention_mask: [B, L//patch_size] - Patched attention mask
+    """
+    B, L = input_ids.shape
+
+    # Get token embeddings
+    token_embeddings = embedding_layer(input_ids)  # [B, L, D]
+
+    # Apply patching to create patch embeddings
+    if patch_size > 1:
+        patched_embeddings = patcher.patch(
+            token_embeddings)  # [B, L//patch_size, D]
+
+        # Also patch attention mask to match
+        truncated_length = (L // patch_size) * patch_size
+        attention_mask_truncated = attention_mask[:, :truncated_length]
+        attention_mask_reshaped = attention_mask_truncated.view(
+            B, -1, patch_size)
+        patched_attention_mask = attention_mask_reshaped.max(dim=2)[
+            0]  # [B, L//patch_size]
+    else:
+        # patch_size=1: no patching
+        patched_embeddings = token_embeddings
+        patched_attention_mask = attention_mask
+
+    return patched_embeddings, patched_attention_mask
 
 
 class SimplePredictor(nn.Module):
@@ -284,66 +353,27 @@ class SimplePredictor(nn.Module):
         return predictions
 
 
-class TrainableJEPA(nn.Module):
-    """
-    Correct JEPA implementation for text.
-
-    Key: Model encodes FULL sequence with normal attention, but we zero out
-    target regions from the representations, then predict what should be there.
-    """
-
-    def __init__(self, context_encoder: Any, predictor: nn.Module) -> None:
-        super().__init__()
-        self.context_encoder = context_encoder
-        self.predictor = predictor
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        context_mask: torch.Tensor,
-        target_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        JEPA forward pass.
-
-        Args:
-            input_ids: [B, L] - Full tokenized sequence
-            attention_mask: [B, L] - 1 for real tokens, 0 for padding
-            context_mask: [B, L] - 1 for visible positions, 0 for masked
-            target_mask: [B, L] - 1 for positions to predict, 0 otherwise
-
-        Returns:
-            predicted_targets: [B, num_targets, D] - Predicted representations
-        """
-        # Encode full sequence with normal attention (respects padding)
-        encoder_output = self.context_encoder.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask  # Only masks padding, not targets!
-        )
-        full_repr = encoder_output.last_hidden_state  # [B, L, D]
-
-        # Zero out target regions (model shouldn't use info from targets)
-        context_repr = full_repr * context_mask.unsqueeze(-1)  # [B, L, D]
-
-        # Predict at target positions
-        predicted_targets = self.predictor(context_repr, target_mask)
-
-        return predicted_targets
-
-
-# Create the predictor and trainable model
+# Create the predictor
 hidden_size = CONTEXT_ENCODER_CONFIG["hidden_size"]
 predictor = SimplePredictor(hidden_dim=hidden_size)
-
-trainable = TrainableJEPA(
-    context_encoder=context_encoder,
-    predictor=predictor
-)
 
 # ----------------------------
 # DeepSpeed initialize (ZeRO-3)
 # ----------------------------
+# Wrap trainable components (context_encoder + predictor) in a single module
+
+
+class TrainableModule(nn.Module):
+    """Wrapper for trainable components for DeepSpeed."""
+
+    def __init__(self, context_encoder, predictor):
+        super().__init__()
+        self.context_encoder = context_encoder
+        self.predictor = predictor
+
+
+trainable = TrainableModule(context_encoder, predictor)
+
 model_parameters = [p for p in trainable.parameters() if p.requires_grad]
 
 
@@ -396,11 +426,11 @@ def to_device(x: Any) -> Any:
         Same structure with tensors moved to device
     """
     if torch.is_tensor(x):
-        return x.to(device, non_blocking=True)
+        return x.to(device, non_blocking=True)  # type: ignore[union-attr]
     if isinstance(x, dict):
         return {k: to_device(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
-        return type(x)(to_device(v) for v in x)
+        return type(x)(to_device(v) for v in x)  # type: ignore[arg-type]
     return x
 
 
@@ -586,21 +616,21 @@ logi("Starting training loop...")
 
 
 # ----------------------------
-# Training loop (Batched processing with tensor-based masks)
+# Training loop
 # ----------------------------
 engine.train()
-for patch_batch in dataloader:
+for token_batch in dataloader:
     engine.zero_grad()
-    patch_batch = to_device(patch_batch)
+    token_batch = to_device(token_batch)
 
-    # Process FULL BATCH at once (not one sequence at a time!)
+    # Prepare batch: tokenize and pad sequences
     batch_token_ids = []
     max_len = 0
 
-    for patches in patch_batch:
-        if len(patches) == 0:
+    for tokens in token_batch:
+        if len(tokens) == 0:
             continue
-        token_ids = tokenizer.convert_tokens_to_ids(patches)
+        token_ids = tokenizer.convert_tokens_to_ids(tokens)
         batch_token_ids.append(token_ids)
         max_len = max(max_len, len(token_ids))
 
@@ -624,50 +654,90 @@ for patch_batch in dataloader:
     attention_mask = torch.tensor(
         attention_masks, device=device).float()  # [B, L]
 
-    # STEP 1: Create context and target masks
-    mask_pair = context_target_creator.create_context_and_targets(
-        input_ids=input_ids,
-        attention_mask=attention_mask
-    )
-
-    context_mask = mask_pair.context_mask  # [B, L]
-    target_mask = mask_pair.target_masks[0]  # [B, L]
-
-    # STEP 2: Forward pass - predict target representations
-    predicted_targets = engine(
+    # STEP 1: Create stream of patches from tokens (I-JEPA style)
+    # This happens BEFORE encoding - we create patch embeddings first
+    context_patch_embeds, patched_attention_mask = create_patched_embeddings(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        context_mask=context_mask,
-        target_mask=target_mask
-    )  # [B, num_targets, D]
+        embedding_layer=context_encoder.get_input_embeddings(),
+        patcher=embedding_patcher,
+        patch_size=patch_size
+    )  # [B, L//patch_size, D], [B, L//patch_size]
 
-    # STEP 3: Get ground truth target representations (no gradients)
+    # For target encoder, create patches the same way
+    with torch.no_grad():
+        target_patch_embeds, _ = create_patched_embeddings(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            embedding_layer=target_encoder.get_input_embeddings(),
+            patcher=embedding_patcher,
+            patch_size=patch_size
+        )  # [B, L//patch_size, D]
+
+    # STEP 2: Create context and target masks on the patch stream
+    B, L_patches, D = context_patch_embeds.shape
+    dummy_input_ids = torch.zeros(
+        B, L_patches, dtype=torch.long, device=device)
+
+    mask_pair = context_target_creator.create_context_and_targets(
+        input_ids=dummy_input_ids,
+        attention_mask=patched_attention_mask
+    )
+
+    context_mask = mask_pair.context_mask  # [B, L_patches]
+    target_mask = mask_pair.target_masks[0]  # [B, L_patches]
+
+    # STEP 3: Encode the patch stream (pass patch embeddings through transformer)
+    # IMPORTANT: Scale position_ids by patch_size so positional encodings reflect token-space positions
+    # Patch 0 → position 0, Patch 1 → position patch_size, Patch 2 → position 2*patch_size, etc.
+    position_ids = torch.arange(0, L_patches, device=device) * patch_size
+    position_ids = position_ids.unsqueeze(0).expand(B, -1)  # [B, L_patches]
+
+    # Context encoder (trainable)
+    context_output = context_encoder.model(
+        inputs_embeds=context_patch_embeds,
+        attention_mask=patched_attention_mask,
+        position_ids=position_ids  # ← Scale positions for patches!
+    )
+    context_repr = context_output.last_hidden_state  # [B, L_patches, D]
+
+    # Target encoder (EMA, no gradients)
     with torch.no_grad():
         target_output = target_encoder.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask
+            inputs_embeds=target_patch_embeds,
+            attention_mask=patched_attention_mask,
+            position_ids=position_ids  # ← Scale positions for patches!
         )
-        full_target_repr = target_output.last_hidden_state  # [B, L, D]
+        target_repr = target_output.last_hidden_state  # [B, L_patches, D]
 
-        # Extract at target positions
-        actual_targets = extract_target_representations(
-            full_target_repr,
-            target_mask
-        )  # [B, num_targets, D]
+    # STEP 4: Apply masks to representations
+    # Zero out target regions from context (JEPA approach)
+    masked_context_repr = context_repr * \
+        context_mask.unsqueeze(-1)  # [B, L_patches, D]
 
-    # STEP 4: Compute loss
+    # STEP 5: Predict target representations from masked context
+    predicted_targets = predictor(
+        masked_context_repr, target_mask)  # [B, num_targets, D]
+
+    # STEP 6: Extract ground truth target representations
+    actual_targets = extract_target_representations(
+        target_repr,
+        target_mask
+    )  # [B, num_targets, D]
+
+    # STEP 7: Compute loss
     loss = loss_calculator(predicted_targets, actual_targets)
 
-    # STEP 5: Backward and optimize
+    # STEP 8: Backward and optimize
     engine.backward(loss)
     engine.step()
 
-    # STEP 6: Update EMA (once per batch!)
+    # STEP 9: Update EMA (once per batch!)
     target_encoder.update()
 
     if RANK == 0:
         num_targets = int(target_mask.sum().item())
         logger.info(
-            f"Loss: {loss.item():.6f} | Batch size: {input_ids.shape[0]} | Total targets: {num_targets}")
+            f"Loss: {loss.item():.6f} | Batch size: {B} | Patches: {L_patches} | Targets: {num_targets}")
 
 logi("Training loop finished.")

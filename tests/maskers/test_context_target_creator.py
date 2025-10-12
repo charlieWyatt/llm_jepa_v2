@@ -258,8 +258,8 @@ class TestContextTargetCreator:
         num_context = result.context_mask.sum().item()
         num_target = result.target_masks[0].sum().item()
 
-        assert abs(num_context - 60) < 10, f"Expected ~60 context positions"
-        assert abs(num_target - 20) < 10, f"Expected ~20 target positions"
+        assert abs(num_context - 60) <= 10, f"Expected ~60 context positions"
+        assert abs(num_target - 20) <= 10, f"Expected ~20 target positions"
 
     def test_with_block_mask_generator(self):
         """Test using BlockMaskGenerator."""

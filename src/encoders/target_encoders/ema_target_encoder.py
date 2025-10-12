@@ -1,5 +1,6 @@
 import copy
 import torch
+import torch.nn as nn
 from src.encoders.base import ContextEncoder
 from src.encoders.target_encoders.base import TargetEncoder
 
@@ -8,7 +9,7 @@ class ema_target_encoder(TargetEncoder):
     def __init__(self, context_encoder: ContextEncoder, ema_decay=0.999):
         super().__init__(context_encoder)
         self.ema_decay = ema_decay
-        self.model = copy.deepcopy(context_encoder)
+        self.model: ContextEncoder = copy.deepcopy(context_encoder)
 
         # Disable gradient updates on the EMA model
         for param in self.model.parameters():
@@ -16,6 +17,10 @@ class ema_target_encoder(TargetEncoder):
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
+
+    def get_input_embeddings(self) -> nn.Module:
+        """Delegate to the wrapped model's get_input_embeddings method."""
+        return self.model.get_input_embeddings()
 
     def update(self):
         with torch.no_grad():
