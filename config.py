@@ -25,6 +25,8 @@ class StrategyConfig(TypedDict):
     LOSS_CALCULATOR: LossCalculatorType
     CONTEXT_MODEL_ID: str
     TARGET_MODEL_ID: str
+    DEFAULT_EMA_DECAY: float
+    BATCH_SIZE: int
 
 
 STRATEGY_CONSTS: StrategyConfig = {
@@ -38,4 +40,6 @@ STRATEGY_CONSTS: StrategyConfig = {
     "LOSS_CALCULATOR": "l2",
     "CONTEXT_MODEL_ID": "allenai/longformer-base-4096",
     "TARGET_MODEL_ID": "allenai/longformer-base-4096",
+    "DEFAULT_EMA_DECAY": 0.99,
+    "BATCH_SIZE": 2
 }

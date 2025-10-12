@@ -1,4 +1,5 @@
 # train.py
+import json
 from src.maskers.block_mask_generator import BlockMaskGenerator
 from src.maskers.random_mask_generator import RandomMaskGenerator
 from src.maskers.utils import extract_target_representations
@@ -71,25 +72,8 @@ if torch.cuda.is_available():
     logger.info(
         f"GPU[{LOCAL_RANK}]: {torch.cuda.get_device_name(torch.cuda.current_device())}")
 
-# ----------------------------
-# Strategy config (unchanged)
-# ----------------------------
-training_dataset = STRATEGY_CONSTS["TRAINING_DATASET"]
-patch_strategy = STRATEGY_CONSTS["PATCH_STRATEGY"]
-patch_size = STRATEGY_CONSTS["PATCH_SIZE"]
-target_mask_strategy = STRATEGY_CONSTS["MASK_STRATEGY"]
-context_mask_strategy = STRATEGY_CONSTS["CONTEXT_STRATEGY"]
-context_encoder_type = STRATEGY_CONSTS["CONTEXT_ENCODER"]
-target_predictor_type = STRATEGY_CONSTS["TARGET_PREDICTOR"]
-loss_calculator_type = STRATEGY_CONSTS["LOSS_CALCULATOR"]
 
-logi(f"Training dataset: {training_dataset}")
-logi(f"Patch strategy: {patch_strategy}")
-logi(f"Patch size: {patch_size}")
-logi(f"Context encoder type: {context_encoder_type}")
-
-DEFAULT_EMA_DECAY = 0.99
-BATCH_SIZE = 2
+logi(json.dumps(STRATEGY_CONSTS))
 
 CONTEXT_ENCODER_CONFIG = {
     "hidden_size": 384,
@@ -112,7 +96,7 @@ has_bf16 = (
 )
 
 DS_CONFIG = {
-    "train_batch_size": BATCH_SIZE,
+    "train_batch_size": STRATEGY_CONSTS["BATCH_SIZE"],
     "train_micro_batch_size_per_gpu": 1,   # ↓ from 2
     "gradient_accumulation_steps": 1,      # keep global batch size similar
     "bf16": {"enabled": bool(has_bf16)},
@@ -145,54 +129,46 @@ DS_CONFIG = {
 # Build components
 # ----------------------------
 logi("Building components...")
-loss_calculator = loss_calculator_builder(loss_calculator_type).build()
+loss_calculator = loss_calculator_builder(STRATEGY_CONSTS["LOSS_CALCULATOR"]).build()
 
-# Create mask generators for context and targets
-# Context generator (what the model can see)
-if context_mask_strategy == "random":
+
+if STRATEGY_CONSTS["CONTEXT_STRATEGY"] == "random":
     context_generator = RandomMaskGenerator(mask_ratio=0.6)  # 60% visible
-elif context_mask_strategy == "block":
+elif STRATEGY_CONSTS["CONTEXT_STRATEGY"] == "block":
     context_generator = BlockMaskGenerator(
         span_length=50)  # Large visible block
 else:
-    raise ValueError(f"Unknown context strategy: {context_mask_strategy}")
+    raise ValueError(f"Unknown context strategy: {STRATEGY_CONSTS['CONTEXT_STRATEGY']}")
 
-# Target generator (what to predict)
-if target_mask_strategy == "random":
+if STRATEGY_CONSTS["MASK_STRATEGY"] == "random":
     target_generator = RandomMaskGenerator(mask_ratio=0.15)  # 15% to predict
-elif target_mask_strategy == "block":
+elif STRATEGY_CONSTS["MASK_STRATEGY"] == "block":
     target_generator = BlockMaskGenerator(span_length=10)  # 10-token block
 else:
-    raise ValueError(f"Unknown target strategy: {target_mask_strategy}")
+    raise ValueError(f"Unknown target strategy: {STRATEGY_CONSTS['MASK_STRATEGY']}")
 
-# Create context-target creator for JEPA-style training
 context_target_creator = ContextTargetCreator(
     context_generator=context_generator,
     target_generator=target_generator,
     num_targets=1  # Single target for now (can increase for multi-target JEPA)
 )
 
-# Context encoder (trainable)
-context_encoder = encoder_builder(context_encoder_type).build(
+context_encoder = encoder_builder(STRATEGY_CONSTS["CONTEXT_ENCODER"]).build(
     model_id=STRATEGY_CONSTS["CONTEXT_MODEL_ID"],
     config=CONTEXT_ENCODER_CONFIG,
 )
 tokenizer = context_encoder.tokenizer
 
-# EMA target encoder (non-trainable, updated via .update())
 target_encoder: ema_target_encoder = ema_target_encoder(
-    context_encoder, DEFAULT_EMA_DECAY)
+    context_encoder, STRATEGY_CONSTS["DEFAULT_EMA_DECAY"])
 target_encoder.eval()                 # disable dropout etc.
 for p in target_encoder.parameters():  # belt & suspenders (already in your class)
     p.requires_grad = False
 
 # Build embedding patcher (I-JEPA style)
 embedding_patcher = patcher_builder(
-    patch_strategy).build(patch_size=patch_size)
+    STRATEGY_CONSTS["PATCH_STRATEGY"]).build(patch_size=STRATEGY_CONSTS["PATCH_SIZE"])
 logi(f"Embedding patcher: {embedding_patcher}")
-
-# Simple text tokenizer for dataloader
-
 
 class TextTokenizer:
     """Tokenizes text into tokens for the dataloader."""
@@ -206,11 +182,11 @@ class TextTokenizer:
 
 
 text_tokenizer = TextTokenizer(tokenizer=context_encoder.tokenizer)
-dataloader = dataloader_builder(training_dataset).build(
-    text_tokenizer, batch_size=BATCH_SIZE)
+dataloader = dataloader_builder(STRATEGY_CONSTS["TRAINING_DATASET"]).build(
+    text_tokenizer, batch_size=STRATEGY_CONSTS["BATCH_SIZE"])
 
 # Target predictor (trainable)
-target_predictor = encoder_builder(target_predictor_type).build(
+target_predictor = encoder_builder(STRATEGY_CONSTS["TARGET_PREDICTOR"]).build(
     model_id=STRATEGY_CONSTS["TARGET_MODEL_ID"],
     config=TARGET_ENCODER_CONFIG,
 )
@@ -234,10 +210,6 @@ class PredictorHead(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
-# ----------------------------
-# Wrap trainables in a single module for DeepSpeed
-# ----------------------------
 
 
 def create_patched_embeddings(
@@ -426,11 +398,11 @@ def to_device(x: Any) -> Any:
         Same structure with tensors moved to device
     """
     if torch.is_tensor(x):
-        return x.to(device, non_blocking=True)  # type: ignore[union-attr]
+        return x.to(device, non_blocking=True)
     if isinstance(x, dict):
         return {k: to_device(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
-        return type(x)(to_device(v) for v in x)  # type: ignore[arg-type]
+        return type(x)(to_device(v) for v in x)
     return x
 
 
@@ -661,7 +633,7 @@ for token_batch in dataloader:
         attention_mask=attention_mask,
         embedding_layer=context_encoder.get_input_embeddings(),
         patcher=embedding_patcher,
-        patch_size=patch_size
+        patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
     )  # [B, L//patch_size, D], [B, L//patch_size]
 
     # For target encoder, create patches the same way
@@ -671,7 +643,7 @@ for token_batch in dataloader:
             attention_mask=attention_mask,
             embedding_layer=target_encoder.get_input_embeddings(),
             patcher=embedding_patcher,
-            patch_size=patch_size
+            patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
         )  # [B, L//patch_size, D]
 
     # STEP 2: Create context and target masks on the patch stream
@@ -690,7 +662,7 @@ for token_batch in dataloader:
     # STEP 3: Encode the patch stream (pass patch embeddings through transformer)
     # IMPORTANT: Scale position_ids by patch_size so positional encodings reflect token-space positions
     # Patch 0 → position 0, Patch 1 → position patch_size, Patch 2 → position 2*patch_size, etc.
-    position_ids = torch.arange(0, L_patches, device=device) * patch_size
+    position_ids = torch.arange(0, L_patches, device=device) * STRATEGY_CONSTS["PATCH_SIZE"]
     position_ids = position_ids.unsqueeze(0).expand(B, -1)  # [B, L_patches]
 
     # Context encoder (trainable)
