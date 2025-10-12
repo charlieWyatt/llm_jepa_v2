@@ -27,6 +27,11 @@ class StrategyConfig(TypedDict):
     TARGET_MODEL_ID: str
     DEFAULT_EMA_DECAY: float
     BATCH_SIZE: int
+    MAX_STEPS: int
+    CHECKPOINT_INTERVAL: int
+    LOG_INTERVAL: int
+    WARMUP_STEPS: int
+    LEARNING_RATE: float
 
 
 STRATEGY_CONSTS: StrategyConfig = {
@@ -41,5 +46,10 @@ STRATEGY_CONSTS: StrategyConfig = {
     "CONTEXT_MODEL_ID": "allenai/longformer-base-4096",
     "TARGET_MODEL_ID": "allenai/longformer-base-4096",
     "DEFAULT_EMA_DECAY": 0.99,
-    "BATCH_SIZE": 2
+    "BATCH_SIZE": 2,
+    "MAX_STEPS": 10000,
+    "CHECKPOINT_INTERVAL": 500,
+    "LOG_INTERVAL": 10,
+    "WARMUP_STEPS": 500,
+    "LEARNING_RATE": 5e-4
 }

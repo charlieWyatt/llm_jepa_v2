@@ -6,7 +6,7 @@ import os
 import torch
 import torch.nn as nn
 import deepspeed
-from typing import Any
+from typing import Any, cast, Dict
 from src.patchers.helpers import create_patched_embeddings
 
 from src.builders.dataloader_builder import dataloader_builder
@@ -17,7 +17,7 @@ from src.builders.loss_calculator_builder import loss_calculator_builder
 from src.maskers.context_target_creator import ContextTargetCreator
 from config import STRATEGY_CONSTS
 from src.zero3.my_deepspeed import MyDeepspeed
-from src.logging.logging_helpers import logi, log_once
+from src.logging.logging_helpers import logi, log_once, get_logger, training_loop_log, save_checkpoint, calculate_gradient_norm
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -33,14 +33,31 @@ def init_dist() -> tuple[bool, int, int, int]:
     Returns:
         tuple: (is_distributed, rank, local_rank, world_size)
     """
-    if torch.cuda.is_available():
-        try:
-            deepspeed.init_distributed(dist_backend="nccl")
-        except Exception:
-            pass
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    # Get logger for this rank
+    logger = get_logger(rank)
+
+    if torch.cuda.is_available() and world_size > 1:
+        try:
+            deepspeed.init_distributed(dist_backend="nccl")
+            logger.log(
+                "Successfully initialized distributed training with NCCL backend")
+        except RuntimeError as e:
+            if "already initialized" in str(e):
+                logger.log("Distributed backend already initialized")
+            else:
+                logger.log(
+                    f"WARNING: Failed to initialize distributed training: {e}")
+                logger.log("Continuing with single-process training")
+                world_size = 1
+                rank = 0
+        except Exception as e:
+            logger.log(f"ERROR: Unexpected error during distributed init: {e}")
+            raise
+
     return world_size > 1, rank, local_rank, world_size
 
 
@@ -131,31 +148,9 @@ text_tokenizer = TextTokenizer(tokenizer=context_encoder.tokenizer)
 dataloader = dataloader_builder(STRATEGY_CONSTS["TRAINING_DATASET"]).build(
     text_tokenizer, batch_size=STRATEGY_CONSTS["BATCH_SIZE"])
 
-# Target predictor (trainable)
-target_predictor = encoder_builder(STRATEGY_CONSTS["TARGET_PREDICTOR"]).build(
-    model_id=STRATEGY_CONSTS["TARGET_MODEL_ID"],
-    config=TARGET_ENCODER_CONFIG,
-)
-
 # ----------------------------
-# Create a simple predictor head if target_predictor expects embeddings
+# Create predictor for target representations
 # ----------------------------
-
-
-class PredictorHead(nn.Module):
-    """Simple MLP head for predicting target representations from combined embeddings"""
-
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, x):
-        return self.net(x)
 
 
 class SimplePredictor(nn.Module):
@@ -175,11 +170,12 @@ class SimplePredictor(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
 
-    def forward(self, context_repr: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, context_repr: torch.Tensor, target_mask: torch.Tensor, context_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
             context_repr: [B, L, D] - context representations (targets zeroed out)
             target_mask: [B, L] - 1 where to predict
+            context_mask: [B, L] - 1 for valid context positions
 
         Returns:
             predictions: [B, num_targets, D]
@@ -201,14 +197,10 @@ class SimplePredictor(nn.Module):
             num_tgt = len(target_indices)
 
             if num_tgt > 0:
-                # Mean-pool over context (non-zero positions)
-                # context_repr[i] has zeros at target positions
-                # Sum over context positions and divide by number of context positions
-                context_sum = context_repr[i].sum(dim=0)  # [D]
-                num_context = (context_repr[i].abs().sum(
-                    dim=-1) > 0).sum()  # Count non-zero positions
+                num_context = context_mask[i].sum()  # [D]
 
                 if num_context > 0:
+                    context_sum = context_repr[i].sum(dim=0)  # [D]
                     context_mean = context_sum / num_context  # [D]
                 else:
                     context_mean = torch.zeros(D, device=device)
@@ -230,6 +222,11 @@ predictor = SimplePredictor(hidden_dim=CONTEXT_ENCODER_CONFIG["hidden_size"])
 # ----------------------------
 MyDeepspeed = MyDeepspeed(context_encoder, predictor, RANK, WORLD_SIZE)
 engine, optimizer = MyDeepspeed.get_engine_and_optim()
+
+
+# CRITICAL FIX: Update EMA to track the DeepSpeed-wrapped encoder
+# The target_encoder must reference the actual trained model, not the original
+target_encoder.context_encoder = engine.module.context_encoder
 
 
 # ----------------------------
@@ -282,7 +279,20 @@ log_once("Starting training loop...", RANK)
 # Training loop
 # ----------------------------
 engine.train()
+
+# Create checkpoint directory
+checkpoint_dir = os.path.join(os.getcwd(), "checkpoints")
+os.makedirs(checkpoint_dir, exist_ok=True)
+log_once(f"Checkpoint directory: {checkpoint_dir}", RANK)
+
+step = 0
 for token_batch in dataloader:
+    if step >= STRATEGY_CONSTS["MAX_STEPS"]:
+        log_once(
+            f"Reached max steps ({STRATEGY_CONSTS['MAX_STEPS']}). Stopping training.", RANK)
+        break
+
+    step += 1
     engine.zero_grad()
     token_batch = to_device(token_batch)
 
@@ -350,6 +360,8 @@ for token_batch in dataloader:
     context_mask = mask_pair.context_mask  # [B, L_patches]
     target_mask = mask_pair.target_masks[0]  # [B, L_patches]
 
+    context_mask = context_mask * (1 - target_mask)
+
     # STEP 3: Encode the patch stream (pass patch embeddings through transformer)
     # IMPORTANT: Scale position_ids by patch_size so positional encodings reflect token-space positions
     # Patch 0 → position 0, Patch 1 → position patch_size, Patch 2 → position 2*patch_size, etc.
@@ -381,7 +393,7 @@ for token_batch in dataloader:
 
     # STEP 5: Predict target representations from masked context
     predicted_targets = predictor(
-        masked_context_repr, target_mask)  # [B, num_targets, D]
+        masked_context_repr, target_mask, context_mask)  # [B, num_targets, D]
 
     # STEP 6: Extract ground truth target representations
     actual_targets = extract_target_representations(
@@ -394,13 +406,56 @@ for token_batch in dataloader:
 
     # STEP 8: Backward and optimize
     engine.backward(loss)
+
+    # Calculate gradient norm for monitoring training stability
+    total_norm = calculate_gradient_norm(engine.module)
+
     engine.step()
 
     # STEP 9: Update EMA (once per batch!)
     target_encoder.update()
 
+    # Logging
     num_targets = int(target_mask.sum().item())
-    log_once(
-        f"Loss: {loss.item():.6f} | Batch size: {B} | Patches: {L_patches} | Targets: {num_targets}", RANK)
+    if step % STRATEGY_CONSTS["LOG_INTERVAL"] == 0:
+        # Get current learning rate from optimizer
+        current_lr = optimizer.param_groups[0]['lr']
+
+        training_loop_log(
+            step=step,
+            max_steps=STRATEGY_CONSTS['MAX_STEPS'],
+            loss=loss.item(),
+            learning_rate=current_lr,
+            grad_norm=total_norm,
+            batch_size=B,
+            num_patches=L_patches,
+            num_targets=num_targets,
+            rank=RANK
+        )
+
+    # Checkpointing
+    if step % STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] == 0:
+        save_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            step=step,
+            engine=engine,
+            optimizer=optimizer,
+            loss=loss.item(),
+            config=cast(Dict[str, Any], STRATEGY_CONSTS),
+            rank=RANK,
+            is_final=False
+        )
 
 log_once("Training loop finished.", RANK)
+
+# Save final checkpoint
+save_checkpoint(
+    checkpoint_dir=checkpoint_dir,
+    step=step,
+    engine=engine,
+    optimizer=optimizer,
+    loss=loss.item(),
+    config=cast(Dict[str, Any], STRATEGY_CONSTS),
+    rank=RANK,
+    is_final=True
+)
