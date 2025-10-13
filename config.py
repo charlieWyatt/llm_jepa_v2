@@ -32,6 +32,7 @@ class StrategyConfig(TypedDict):
     LOG_INTERVAL: int
     WARMUP_STEPS: int
     LEARNING_RATE: float
+    MAX_SEQ_LENGTH: int
 
 
 STRATEGY_CONSTS: StrategyConfig = {
@@ -51,5 +52,6 @@ STRATEGY_CONSTS: StrategyConfig = {
     "CHECKPOINT_INTERVAL": 500,
     "LOG_INTERVAL": 10,
     "WARMUP_STEPS": 500,
-    "LEARNING_RATE": 5e-4
+    "LEARNING_RATE": 5e-4,
+    "MAX_SEQ_LENGTH": 4096
 }

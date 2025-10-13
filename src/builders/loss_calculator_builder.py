@@ -8,21 +8,22 @@ class L2LossCalculator:
     def __init__(self):
         self.loss_fn = torch.nn.MSELoss(reduction="mean")
 
-    def __call__(self, target_embeddings, predicted_embeddings):
+    def __call__(self, predicted_embeddings, target_embeddings):
         """
         Args:
-            target_embeddings: Tensor of shape (batch_size, embedding_dim)
-            predicted_embeddings: list of tensors, each of shape (batch_size, embedding_dim)
+            predicted_embeddings: Tensor of shape (batch_size, num_targets, embedding_dim)
+            target_embeddings: Tensor of shape (batch_size, num_targets, embedding_dim)
         Returns:
             Scalar loss
         """
-        if not predicted_embeddings:
+        if predicted_embeddings is None or predicted_embeddings.numel() == 0:
             raise ValueError("predicted_embeddings is empty")
+        
+        if target_embeddings is None or target_embeddings.numel() == 0:
+            raise ValueError("target_embeddings is empty")
 
-        stacked_preds = torch.stack(predicted_embeddings, dim=0)
-        avg_pred = stacked_preds.mean(dim=0)
+        return self.loss_fn(predicted_embeddings, target_embeddings)
 
-        return self.loss_fn(avg_pred, target_embeddings)
 
 
 class LossStrategy(Enum):

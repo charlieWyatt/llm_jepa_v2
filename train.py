@@ -18,8 +18,16 @@ from src.maskers.context_target_creator import ContextTargetCreator
 from config import STRATEGY_CONSTS
 from src.zero3.my_deepspeed import MyDeepspeed
 from src.logging.logging_helpers import logi, log_once, get_logger, training_loop_log, save_checkpoint, calculate_gradient_norm
+from src.predictors.simple_predictor import SimplePredictor
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+def validate_token_length(token_ids):
+    max_allowed_tokens = STRATEGY_CONSTS["PATCH_SIZE"] * STRATEGY_CONSTS["MAX_SEQ_LENGTH"]
+    if len(token_ids) > max_allowed_tokens:
+        log_once(f"WARNING: Truncating sequence from {len(token_ids)} to {max_allowed_tokens} tokens", RANK)
+        return token_ids[:max_allowed_tokens]
+    return token_ids
 
 # ----------------------------
 # DeepSpeed distributed init
@@ -148,74 +156,10 @@ text_tokenizer = TextTokenizer(tokenizer=context_encoder.tokenizer)
 dataloader = dataloader_builder(STRATEGY_CONSTS["TRAINING_DATASET"]).build(
     text_tokenizer, batch_size=STRATEGY_CONSTS["BATCH_SIZE"])
 
-# ----------------------------
-# Create predictor for target representations
-# ----------------------------
-
-
-class SimplePredictor(nn.Module):
-    """
-    Simple predictor that uses full context to predict target representations.
-
-    Uses mean-pooling of context to predict each target position.
-    In a more sophisticated version, you'd use cross-attention from targets to context.
-    """
-
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim)
-        )
-
-    def forward(self, context_repr: torch.Tensor, target_mask: torch.Tensor, context_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            context_repr: [B, L, D] - context representations (targets zeroed out)
-            target_mask: [B, L] - 1 where to predict
-            context_mask: [B, L] - 1 for valid context positions
-
-        Returns:
-            predictions: [B, num_targets, D]
-        """
-        B, L, D = context_repr.shape
-        device = context_repr.device
-
-        # Find max number of targets
-        num_targets = int(target_mask.sum(dim=1).max().item())
-
-        if num_targets == 0:
-            return torch.zeros(B, 1, D, device=device)
-
-        predictions = torch.zeros(B, num_targets, D, device=device)
-
-        # For each sample, use full context to predict at target positions
-        for i in range(B):
-            target_indices = torch.where(target_mask[i] == 1)[0]
-            num_tgt = len(target_indices)
-
-            if num_tgt > 0:
-                num_context = context_mask[i].sum()  # [D]
-
-                if num_context > 0:
-                    context_sum = context_repr[i].sum(dim=0)  # [D]
-                    context_mean = context_sum / num_context  # [D]
-                else:
-                    context_mean = torch.zeros(D, device=device)
-
-                # Predict same representation for all targets (simple baseline)
-                # In practice, you'd want position-specific predictions
-                pred = self.proj(context_mean.unsqueeze(0))  # [1, D]
-                predictions[i, :num_tgt] = pred.expand(
-                    num_tgt, -1)  # [num_tgt, D]
-
-        return predictions
-
-
 # Create the predictor
 predictor = SimplePredictor(hidden_dim=CONTEXT_ENCODER_CONFIG["hidden_size"])
+predictor = predictor.to(dtype=torch.bfloat16)
+
 
 # ----------------------------
 # DeepSpeed initialize (ZeRO-3)
@@ -304,6 +248,10 @@ for token_batch in dataloader:
         if len(tokens) == 0:
             continue
         token_ids = tokenizer.convert_tokens_to_ids(tokens)
+        
+        # Truncate if needed
+        token_ids = validate_token_length(token_ids)
+        
         batch_token_ids.append(token_ids)
         max_len = max(max_len, len(token_ids))
 
@@ -337,6 +285,8 @@ for token_batch in dataloader:
         patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
     )  # [B, L//patch_size, D], [B, L//patch_size]
 
+    context_patch_embeds = context_patch_embeds.to(dtype=torch.bfloat16)
+
     # For target encoder, create patches the same way
     with torch.no_grad():
         target_patch_embeds, _ = create_patched_embeddings(
@@ -346,6 +296,7 @@ for token_batch in dataloader:
             patcher=embedding_patcher,
             patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
         )  # [B, L//patch_size, D]
+        target_patch_embeds = target_patch_embeds.to(dtype=torch.bfloat16)
 
     # STEP 2: Create context and target masks on the patch stream
     B, L_patches, D = context_patch_embeds.shape
@@ -362,44 +313,41 @@ for token_batch in dataloader:
 
     context_mask = context_mask * (1 - target_mask)
 
-    # STEP 3: Encode the patch stream (pass patch embeddings through transformer)
-    # IMPORTANT: Scale position_ids by patch_size so positional encodings reflect token-space positions
-    # Patch 0 → position 0, Patch 1 → position patch_size, Patch 2 → position 2*patch_size, etc.
-    position_ids = torch.arange(
-        0, L_patches, device=device) * STRATEGY_CONSTS["PATCH_SIZE"]
-    position_ids = position_ids.unsqueeze(0).expand(B, -1)  # [B, L_patches]
-
     # Context encoder (trainable)
     context_output = context_encoder.model(
         inputs_embeds=context_patch_embeds,
         attention_mask=patched_attention_mask,
-        position_ids=position_ids  # ← Scale positions for patches!
     )
     context_repr = context_output.last_hidden_state  # [B, L_patches, D]
+
+    context_repr = context_repr.to(dtype=torch.bfloat16)
+
 
     # Target encoder (EMA, no gradients)
     with torch.no_grad():
         target_output = target_encoder.model(
             inputs_embeds=target_patch_embeds,
             attention_mask=patched_attention_mask,
-            position_ids=position_ids  # ← Scale positions for patches!
         )
         target_repr = target_output.last_hidden_state  # [B, L_patches, D]
+        target_repr = target_repr.to(dtype=torch.bfloat16)
 
     # STEP 4: Apply masks to representations
     # Zero out target regions from context (JEPA approach)
     masked_context_repr = context_repr * \
         context_mask.unsqueeze(-1)  # [B, L_patches, D]
 
+    masked_context_repr = masked_context_repr.to(dtype=torch.bfloat16)
+
     # STEP 5: Predict target representations from masked context
-    predicted_targets = predictor(
-        masked_context_repr, target_mask, context_mask)  # [B, num_targets, D]
+    predicted_targets = engine.module.predictor(masked_context_repr, target_mask, context_mask)
 
     # STEP 6: Extract ground truth target representations
     actual_targets = extract_target_representations(
         target_repr,
         target_mask
     )  # [B, num_targets, D]
+
 
     # STEP 7: Compute loss
     loss = loss_calculator(predicted_targets, actual_targets)

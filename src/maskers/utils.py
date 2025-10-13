@@ -29,18 +29,21 @@ def extract_target_representations(
     """
     B, L, D = representations.shape
     device = representations.device
+    dtype = representations.dtype
 
     num_targets = int(target_mask.sum(dim=1).max().item())
 
     if num_targets == 0:
-        return torch.zeros(B, 1, D, device=device)
+        return torch.zeros(B, 1, D, device=device, dtype=dtype)
 
-    targets = torch.zeros(B, num_targets, D, device=device)
+    targets = torch.zeros(B, num_targets, D, device=device, dtype=dtype)
 
     for i in range(B):
-        target_indices = torch.where(target_mask[i] == 1)[0]
-        num_tgt = len(target_indices)
+        num_tgt = int(target_mask[i].sum().item())
+        
         if num_tgt > 0:
+            target_indices = torch.where(target_mask[i] == 1)[0]
+            target_indices = target_indices[:num_tgt]
             targets[i, :num_tgt] = representations[i, target_indices]
 
     return targets

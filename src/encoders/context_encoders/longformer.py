@@ -67,19 +67,11 @@ class Longformer(ContextEncoder):
 
         return self.model.embeddings.word_embeddings(token_ids)
 
-    def forward(self, input_texts) -> torch.Tensor:
+    def forward(self, 
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Encode text inputs and return representations."""
-        inputs = self.tokenizer(
-            input_texts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-            max_length=4096,
+        return self.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask
         )
-        device = next(self.model.parameters()).device
-
-        for k, v in inputs.items():
-            if hasattr(v, "to"):
-                inputs[k] = v.to(device)
-
-        return self.model(**inputs).last_hidden_state
