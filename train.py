@@ -129,12 +129,6 @@ context_encoder = encoder_builder(STRATEGY_CONSTS["CONTEXT_ENCODER"]).build(
 )
 tokenizer = context_encoder.tokenizer
 
-target_encoder: ema_target_encoder = ema_target_encoder(
-    context_encoder, STRATEGY_CONSTS["DEFAULT_EMA_DECAY"])
-target_encoder.eval()                 # disable dropout etc.
-for p in target_encoder.parameters():  # belt & suspenders (already in your class)
-    p.requires_grad = False
-
 # Build embedding patcher (I-JEPA style)
 embedding_patcher = patcher_builder(
     STRATEGY_CONSTS["PATCH_STRATEGY"]).build(patch_size=STRATEGY_CONSTS["PATCH_SIZE"])
@@ -156,22 +150,25 @@ text_tokenizer = TextTokenizer(tokenizer=context_encoder.tokenizer)
 dataloader = dataloader_builder(STRATEGY_CONSTS["TRAINING_DATASET"]).build(
     text_tokenizer, batch_size=STRATEGY_CONSTS["BATCH_SIZE"])
 
-# Create the predictor
+
 predictor = SimplePredictor(hidden_dim=CONTEXT_ENCODER_CONFIG["hidden_size"])
 predictor = predictor.to(dtype=torch.bfloat16)
-
 
 # ----------------------------
 # DeepSpeed initialize (ZeRO-3)
 # ----------------------------
 MyDeepspeed = MyDeepspeed(context_encoder, predictor, RANK, WORLD_SIZE)
-engine, optimizer = MyDeepspeed.get_engine_and_optim()
+engine, optimizer, predictor, predictor_optimizer = MyDeepspeed.get_engine_and_optim()
 
 
-# CRITICAL FIX: Update EMA to track the DeepSpeed-wrapped encoder
-# The target_encoder must reference the actual trained model, not the original
-target_encoder.context_encoder = engine.module.context_encoder
-
+# ----------------------------
+# Target Encoder
+# ----------------------------
+target_encoder: ema_target_encoder = ema_target_encoder(
+    context_encoder, STRATEGY_CONSTS["DEFAULT_EMA_DECAY"])
+target_encoder.eval()                 # disable dropout etc.
+for p in target_encoder.parameters():  # belt & suspenders (already in your class)
+    p.requires_grad = False
 
 # ----------------------------
 # Device plumbing
@@ -197,11 +194,8 @@ def to_device(x: Any) -> Any:
         return type(x)(to_device(v) for v in x)
     return x
 
-
-if hasattr(loss_calculator, "to"):
-    loss_calculator = loss_calculator.to(device)
-if hasattr(target_encoder, "to"):
-    target_encoder = target_encoder.to(device)
+target_encoder = target_encoder.to(device)
+predictor = predictor.to(device)
 
 torch.backends.cudnn.benchmark = True
 try:
@@ -237,7 +231,9 @@ for token_batch in dataloader:
         break
 
     step += 1
+    logi(f"Step {step} - START", RANK)
     engine.zero_grad()
+    predictor_optimizer.zero_grad()
     token_batch = to_device(token_batch)
 
     # Prepare batch: tokenize and pad sequences
@@ -275,28 +271,27 @@ for token_batch in dataloader:
     attention_mask = torch.tensor(
         attention_masks, device=device).float()  # [B, L]
 
+    logi(f"Step {step} - D: creating patches", RANK)
+
     # STEP 1: Create stream of patches from tokens (I-JEPA style)
     # This happens BEFORE encoding - we create patch embeddings first
     context_patch_embeds, patched_attention_mask = create_patched_embeddings(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        embedding_layer=context_encoder.get_input_embeddings(),
+        embedding_layer=engine.module.get_input_embeddings(),
         patcher=embedding_patcher,
         patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
     )  # [B, L//patch_size, D], [B, L//patch_size]
 
     context_patch_embeds = context_patch_embeds.to(dtype=torch.bfloat16)
 
-    # For target encoder, create patches the same way
+    logi(f"Step {step} - E: context patches created", RANK)
+
+    # For target encoder, reuse the SAME patch embeddings (they're identical input tokens)
     with torch.no_grad():
-        target_patch_embeds, _ = create_patched_embeddings(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            embedding_layer=target_encoder.get_input_embeddings(),
-            patcher=embedding_patcher,
-            patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
-        )  # [B, L//patch_size, D]
-        target_patch_embeds = target_patch_embeds.to(dtype=torch.bfloat16)
+        target_patch_embeds = context_patch_embeds.detach().clone()
+
+    logi(f"Step {step} - F: target patches created", RANK)
 
     # STEP 2: Create context and target masks on the patch stream
     B, L_patches, D = context_patch_embeds.shape
@@ -311,57 +306,102 @@ for token_batch in dataloader:
     context_mask = mask_pair.context_mask  # [B, L_patches]
     target_mask = mask_pair.target_masks[0]  # [B, L_patches]
 
+    logi(f"Step {step} - G: masks created", RANK)
+
     context_mask = context_mask * (1 - target_mask)
 
+    # Calculate GLOBAL max targets across all ranks ONCE
+    local_max_targets = int(target_mask.sum(dim=1).max().item())
+
+    if IS_DIST:
+        max_targets_tensor = torch.tensor(local_max_targets, device=device)
+        torch.distributed.all_reduce(max_targets_tensor, op=torch.distributed.ReduceOp.MAX)
+        global_max_targets = int(max_targets_tensor.item())
+        logi(f"Step {step} - G2: global_max_targets={global_max_targets}, local_max={local_max_targets}", RANK)
+    else:
+        global_max_targets = local_max_targets
+
     # Context encoder (trainable)
-    context_output = context_encoder.model(
+    context_output = engine.module.model(
         inputs_embeds=context_patch_embeds,
         attention_mask=patched_attention_mask,
     )
-    context_repr = context_output.last_hidden_state  # [B, L_patches, D]
+    context_repr = context_output.last_hidden_state.to(dtype=torch.bfloat16)
 
-    context_repr = context_repr.to(dtype=torch.bfloat16)
+    logi(f"Step {step} - H: context encoder done", RANK)
 
-
-    # Target encoder (EMA, no gradients)
+    # Target representations: Use context encoder with stop_grad
+    # NOTE: This is NOT using EMA yet - just the same encoder with no gradients
+    # This works as a baseline, but we're not getting the benefits of EMA
     with torch.no_grad():
-        target_output = target_encoder.model(
+        target_repr = engine.module.model(
             inputs_embeds=target_patch_embeds,
             attention_mask=patched_attention_mask,
         )
-        target_repr = target_output.last_hidden_state  # [B, L_patches, D]
-        target_repr = target_repr.to(dtype=torch.bfloat16)
+        target_repr = target_repr.last_hidden_state.to(dtype=torch.bfloat16)
+
+
+    logi(f"Step {step} - I: target encoder done", RANK)
 
     # STEP 4: Apply masks to representations
-    # Zero out target regions from context (JEPA approach)
-    masked_context_repr = context_repr * \
-        context_mask.unsqueeze(-1)  # [B, L_patches, D]
-
+    masked_context_repr = context_repr * context_mask.unsqueeze(-1)
     masked_context_repr = masked_context_repr.to(dtype=torch.bfloat16)
 
-    # STEP 5: Predict target representations from masked context
-    predicted_targets = engine.module.predictor(masked_context_repr, target_mask, context_mask)
+    logi(f"Step {step} - I2: calling predictor", RANK)
 
-    # STEP 6: Extract ground truth target representations
+    # STEP 5: Predict target representations (already handles padding internally)
+    predicted_targets = predictor(
+        masked_context_repr, 
+        target_mask, 
+        context_mask,
+        global_max_targets
+    )
+
+    logi(f"Step {step} - I3: predictor done, predicted_targets.shape={predicted_targets.shape}", RANK)
+
+    # STEP 6: Extract ground truth target representations (pass global max)
     actual_targets = extract_target_representations(
         target_repr,
-        target_mask
-    )  # [B, num_targets, D]
+        target_mask,
+        global_max_targets  # Pass the global max
+    )
+    torch.distributed.barrier()
+
+    logi(f"Step {step} - J: prediction done", RANK)
 
 
     # STEP 7: Compute loss
     loss = loss_calculator(predicted_targets, actual_targets)
 
+    logi(f"Step {step} - K: loss={loss.item():.4f}", RANK)
+
+    torch.distributed.barrier()
+
+    logi(f"Step {step} - K2: after sync", RANK)
+
+    logi(f"Step {step} - K2: after sync, checking tensors", RANK)
+    logi(f"Step {step} - predicted_targets requires_grad: {predicted_targets.requires_grad}", RANK)
+    logi(f"Step {step} - actual_targets requires_grad: {actual_targets.requires_grad}", RANK)
+    logi(f"Step {step} - loss requires_grad: {loss.requires_grad}", RANK)
+
+
+    if torch.isnan(loss) or torch.isinf(loss):
+        logi(f"Step {step} - WARNING: Invalid loss detected! loss={loss.item()}", RANK)
+        raise Exception("broke")  # Skip this batch
+
     # STEP 8: Backward and optimize
     engine.backward(loss)
+
+    logi(f"Step {step} - L: backward done", RANK)
 
     # Calculate gradient norm for monitoring training stability
     total_norm = calculate_gradient_norm(engine.module)
 
     engine.step()
+    predictor_optimizer.step()
 
-    # STEP 9: Update EMA (once per batch!)
-    target_encoder.update()
+    # # STEP 9: Update EMA (once per batch!)
+    # target_encoder.update()
 
     # Logging
     num_targets = int(target_mask.sum().item())
@@ -382,7 +422,7 @@ for token_batch in dataloader:
         )
 
     # Checkpointing
-    if step % STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] == 0:
+    if STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] and step % STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] == 0:
         save_checkpoint(
             checkpoint_dir=checkpoint_dir,
             step=step,
@@ -393,6 +433,8 @@ for token_batch in dataloader:
             rank=RANK,
             is_final=False
         )
+    logi(f"Step {step} - END", RANK)
+    
 
 log_once("Training loop finished.", RANK)
 

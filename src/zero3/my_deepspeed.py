@@ -6,47 +6,50 @@ import deepspeed
 from src.zero3.config import DS_CONFIG
 from typing import Any
 
-
-class TrainableModule(nn.Module):
-    """Wrapper for trainable components for DeepSpeed."""
-
-    def __init__(self, context_encoder, predictor):
-        super().__init__()
-        self.context_encoder = context_encoder
-        self.predictor = predictor
-
-
 class MyDeepspeed():
     def __init__(self, context_encoder, predictor, gpu_rank, world_size):
         self.gpu_rank = gpu_rank
         self.world_size = world_size
-        trainable = TrainableModule(context_encoder, predictor)
+        
+        # Store predictor separately
+        self.predictor = predictor
+        
+        # Only encoder parameters for DeepSpeed
+        self.model_parameters = [p for p in context_encoder.parameters() if p.requires_grad]
 
-        self.model_parameters = [
-            p for p in trainable.parameters() if p.requires_grad]
+        # Calculate pre-shard stats for encoder only
+        self.pre_total_all = self._sum_params_module(context_encoder, trainable_only=False)
+        self.pre_total_trn = self._sum_params_module(context_encoder, trainable_only=True)
+        self.pre_global_numels = {name: p.numel() for name, p in context_encoder.named_parameters()}
 
-        self.pre_total_all = self._sum_params_module(
-            trainable, trainable_only=False)
-        self.pre_total_trn = self._sum_params_module(
-            trainable, trainable_only=True)
-        self.pre_global_numels = {name: p.numel()
-                                  for name, p in trainable.named_parameters()}
-
+        # Initialize DeepSpeed with ONLY the encoder
         self.engine, self.optimizer, _, _ = deepspeed.initialize(
-            model=trainable,
-            model_parameters=self.model_parameters,  # type:ignore
+            model=context_encoder,
+            model_parameters=self.model_parameters,  # Only encoder params
             config=DS_CONFIG,
         )
 
+        # Create separate optimizer for predictor (not managed by DeepSpeed)
+        predictor_params = [p for p in predictor.parameters() if p.requires_grad]
+        self.predictor_optimizer = torch.optim.AdamW( # TODO: Make this also come from ds_config maybe?
+            predictor_params,
+            lr=0.0005,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01
+        )
         zero_on = self.engine.zero_optimization()
         zero_stage = self.engine.zero_optimization_stage()
 
         logi(
-            f"DeepSpeed ZeRO enabled: {zero_on}, stage: {zero_stage}, dp_world_size: {getattr(self.engine, 'dp_world_size', self.world_size)}", self.gpu_rank)
+            f"DeepSpeed ZeRO enabled: {zero_on}, stage: {zero_stage}, dp_world_size: {getattr(self.engine, 'dp_world_size', self.world_size)}", 
+            self.gpu_rank
+        )
         assert zero_on and zero_stage == 3, f"Expected ZeRO stage 3, got: {zero_stage}"
 
     def get_engine_and_optim(self):
-        return self.engine, self.optimizer
+        # Return both optimizers and predictor
+        return self.engine, self.optimizer, self.predictor, self.predictor_optimizer
 
     def log_gpu_memory_usage(self):
 
