@@ -3,6 +3,8 @@ import os
 import torch
 import torch.nn as nn
 from typing import Any, cast, Dict
+import time
+from tqdm import tqdm
 
 from accelerate import Accelerator
 from accelerate.utils import DeepSpeedPlugin
@@ -33,12 +35,45 @@ def validate_token_length(token_ids):
         return token_ids[:max_allowed_tokens]
     return token_ids
 
+def count_dataset_size(tokenizer, batch_size=100, max_count=None):
+    """Count the total number of samples in the dataset."""
+    print("Counting dataset size...", end='', flush=True)
+    
+    class CountTokenizer:
+        def __init__(self, tok):
+            self.tokenizer = tok
+        
+        def create_patches(self, text: str):
+            return self.tokenizer.tokenize(text)
+    
+    count_tokenizer = CountTokenizer(tokenizer)
+    count_dataloader = dataloader_builder(STRATEGY_CONSTS["TRAINING_DATASET"]).build(
+        count_tokenizer, batch_size=batch_size
+    )
+    
+    total_count = 0
+    for batch in count_dataloader:
+        batch_count = len([t for t in batch if len(t) > 0])
+        total_count += batch_count
+        
+        if max_count and total_count >= max_count:
+            break
+    
+    print(f" {total_count:,} samples found\n")
+    return total_count
 
+def format_time(seconds):
+    """Format seconds into human-readable time string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    else:
+        return f"{seconds/3600:.1f}h"
 
 # ============================================
-# ACCELERATE INITIALIZATION (replaces all manual DeepSpeed setup)
+# ACCELERATE INITIALIZATION
 # ============================================
-
 
 LOG_DIR = "/g/data/oy87/cw9909/llm_jepa/logs"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -113,6 +148,18 @@ context_encoder = encoder_builder(STRATEGY_CONSTS["CONTEXT_ENCODER"]).build(
 )
 tokenizer = context_encoder.tokenizer
 
+# Count dataset size (only on rank 0)
+if RANK == 0:
+    TOTAL_DATASET_SIZE = count_dataset_size(tokenizer, batch_size=100, max_count=10000)
+else:
+    TOTAL_DATASET_SIZE = None
+
+# Broadcast to all ranks
+if IS_DIST:
+    size_tensor = torch.tensor([TOTAL_DATASET_SIZE or 0], device=device)
+    torch.distributed.broadcast(size_tensor, src=0)
+    TOTAL_DATASET_SIZE = int(size_tensor.item())
+
 embedding_patcher = patcher_builder(
     STRATEGY_CONSTS["PATCH_STRATEGY"]).build(patch_size=STRATEGY_CONSTS["PATCH_SIZE"])
 log_once(f"Embedding patcher: {embedding_patcher}", RANK)
@@ -155,15 +202,13 @@ for p in target_encoder.parameters():
     p.requires_grad = False
 
 # ----------------------------
-# ACCELERATE PREPARE (replaces DeepSpeed initialization)
+# ACCELERATE PREPARE
 # ----------------------------
 context_encoder, predictor, optimizer, predictor_optimizer, dataloader = accelerator.prepare(
     context_encoder, predictor, optimizer, predictor_optimizer, dataloader
 )
 
 target_encoder = target_encoder.to(device)
-
-
 
 # ----------------------------
 # Training Loop
@@ -173,7 +218,14 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 
 log_once("Starting training loop...", RANK)
 
+# Initialize progress tracking
+training_start = time.time()
+total_samples = 0
+pbar = tqdm(total=TOTAL_DATASET_SIZE, desc="Training", unit="samples", disable=(RANK != 0))
+
 for step, token_batch in enumerate(dataloader, start=1):
+    step_start = time.time()
+    
     max_steps = STRATEGY_CONSTS.get('MAX_STEPS')
     if max_steps is not None and step > max_steps:
         break
@@ -194,6 +246,9 @@ for step, token_batch in enumerate(dataloader, start=1):
 
     if len(batch_token_ids) == 0:
         continue
+
+    batch_size = len(batch_token_ids)
+    total_samples += batch_size
 
     # Pad sequences
     padded_ids = []
@@ -243,7 +298,7 @@ for step, token_batch in enumerate(dataloader, start=1):
     else:
         global_max_targets = local_max_targets
 
-    # Forward pass - use accelerator.unwrap_model() to access model attributes
+    # Forward pass
     context_output = accelerator.unwrap_model(context_encoder).model(
         inputs_embeds=context_patch_embeds,
         attention_mask=patched_attention_mask,
@@ -282,7 +337,7 @@ for step, token_batch in enumerate(dataloader, start=1):
         logi(f"Step {step} - WARNING: Invalid loss detected!", RANK)
         continue
 
-    # Backward - Accelerate handles gradient scaling and accumulation
+    # Backward
     accelerator.backward(loss)
 
     # Calculate gradient norm
@@ -296,9 +351,19 @@ for step, token_batch in enumerate(dataloader, start=1):
 
     target_encoder.update(accelerator.unwrap_model(context_encoder))
 
+    # Track timing
+    step_time = time.time() - step_start
+    elapsed = time.time() - training_start
+    throughput = total_samples / elapsed if elapsed > 0 else 0
+    
+    # Update progress bar
+    pbar.update(batch_size)
+    pbar.set_postfix({'loss': f'{loss.item():.4f}', 'samples/s': f'{throughput:.1f}'})
+
     # Logging
     if step % STRATEGY_CONSTS["LOG_INTERVAL"] == 0:
         current_lr = optimizer.param_groups[0]['lr']
+        
         training_loop_log(
             step=step,
             max_steps=STRATEGY_CONSTS['MAX_STEPS'],
@@ -310,6 +375,7 @@ for step, token_batch in enumerate(dataloader, start=1):
             num_targets=int(target_mask.sum().item()),
             rank=RANK
         )
+        
         accelerator.log({
             "train/loss": loss.item(),
             "train/learning_rate": current_lr,
@@ -317,6 +383,9 @@ for step, token_batch in enumerate(dataloader, start=1):
             "train/batch_size": B,
             "train/num_patches": L_patches,
             "train/num_targets": int(target_mask.sum().item()),
+            "train/step_time": step_time,
+            "train/throughput": throughput,
+            "train/total_samples": total_samples,
         }, step=step)
 
     # Checkpointing
@@ -334,7 +403,9 @@ for step, token_batch in enumerate(dataloader, start=1):
                 is_final=False
             )
 
-log_once("Training loop finished.", RANK)
+pbar.close()
+log_once(f"Training finished. Total time: {format_time(time.time() - training_start)}", RANK)
+
 accelerator.end_training()
 
 # Final checkpoint
