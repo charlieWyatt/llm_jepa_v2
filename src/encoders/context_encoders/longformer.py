@@ -14,9 +14,17 @@ class Longformer(ContextEncoder):
         self,
         model_id: str | None = None,
         config: dict | None = None,
+        load_pretrained: bool = False,
         **kwargs,
     ):
-        """Load Longformer from local checkpoint."""
+        """
+        Load Longformer from local checkpoint.
+        
+        Args:
+            model_id: Model identifier (not used when loading locally)
+            config: Optional config overrides
+            load_pretrained: If True, load pretrained weights. If False, initialize with random weights.
+        """
         super().__init__()
         local_dir = self.LOCAL_LONGFORMER_PATH
 
@@ -24,20 +32,36 @@ class Longformer(ContextEncoder):
             raise FileNotFoundError(
                 f"Local model directory not found: {local_dir}")
 
+        # Always load tokenizer from pretrained (you need the vocabulary)
         self._tokenizer = LongformerTokenizer.from_pretrained(
             local_dir, local_files_only=True
         )
 
+        # Load config
+        base_config = LongformerConfig.from_pretrained(
+            local_dir, local_files_only=True
+        )
+        
+        # Apply config overrides if provided
         if config:
-            base = LongformerConfig.from_pretrained(
-                local_dir, local_files_only=True)
             for k, v in config.items():
-                if hasattr(base, k):
-                    setattr(base, k, v)
-            self.model = LongformerModel(base)
-        else:
+                if hasattr(base_config, k):
+                    setattr(base_config, k, v)
+
+        # Initialize model with or without pretrained weights
+        if load_pretrained:
+            # Load pretrained weights
             self.model = LongformerModel.from_pretrained(
-                local_dir, local_files_only=True)
+                local_dir, 
+                config=base_config,
+                local_files_only=True
+            )
+            print("✓ Loaded Longformer with PRETRAINED weights")
+        else:
+            # Initialize with RANDOM weights
+            self.model = LongformerModel(base_config)
+            print(f"✓ Initialized Longformer with RANDOM weights: {self.model.num_parameters():,} parameters")
+
 
     @property
     def tokenizer(self):

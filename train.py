@@ -29,6 +29,29 @@ def validate_token_length(token_ids):
         return token_ids[:max_allowed_tokens]
     return token_ids
 
+def gradient_logging_checks(step, global_max_targets, predicted_targets, 
+                           target_mask, context_mask, loss, rank):
+    """Check for gradient issues and return True if batch should be skipped."""
+    if global_max_targets == 0:
+        logi(f"Step {step} - WARNING: No targets in batch, skipping", rank)
+        return True  # Skip this batch
+    
+    # Check for degenerate cases
+    if not predicted_targets.requires_grad:
+        logi(f"Step {step} - ERROR: predicted_targets missing grad", rank)
+        logi(f"  global_max_targets={global_max_targets}", rank)
+        logi(f"  target_mask sum={target_mask.sum().item()}", rank)
+        logi(f"  context_mask sum={context_mask.sum().item()}", rank)
+        return True  # Skip this batch
+    
+    # Also check loss
+    if not loss.requires_grad:
+        logi(f"Step {step} - ERROR: loss missing grad", rank)
+        logi(f"  loss value={loss.item()}", rank)
+        return True  # Skip this batch
+    
+    return False  # Don't skip - everything looks good
+
 # ----------------------------
 # DeepSpeed distributed init
 # ----------------------------
@@ -303,6 +326,11 @@ for token_batch in dataloader:
         attention_mask=patched_attention_mask
     )
 
+    logi(f"Step {step} - G_DEBUG: batch_size={B}, L_patches={L_patches}", RANK)
+    logi(f"Step {step} - G_DEBUG: patched_attention_mask sum per sample={patched_attention_mask.sum(dim=1).tolist()}", RANK)
+    logi(f"Step {step} - G_DEBUG: context_mask sum per sample={mask_pair.context_mask.sum(dim=1).tolist()}", RANK)
+    logi(f"Step {step} - G_DEBUG: target_mask sum per sample={mask_pair.target_masks[0].sum(dim=1).tolist()}", RANK)
+
     context_mask = mask_pair.context_mask  # [B, L_patches]
     target_mask = mask_pair.target_masks[0]  # [B, L_patches]
 
@@ -347,7 +375,8 @@ for token_batch in dataloader:
     masked_context_repr = context_repr * context_mask.unsqueeze(-1)
     masked_context_repr = masked_context_repr.to(dtype=torch.bfloat16)
 
-    logi(f"Step {step} - I2: calling predictor", RANK)
+    logi(f"Step {step} - I2: calling predictor with global_max_targets={global_max_targets}", RANK)
+
 
     # STEP 5: Predict target representations (already handles padding internally)
     predicted_targets = predictor(
@@ -364,7 +393,7 @@ for token_batch in dataloader:
         target_repr,
         target_mask,
         global_max_targets  # Pass the global max
-    )
+    ).detach()
     torch.distributed.barrier()
 
     logi(f"Step {step} - J: prediction done", RANK)
@@ -372,6 +401,8 @@ for token_batch in dataloader:
 
     # STEP 7: Compute loss
     loss = loss_calculator(predicted_targets, actual_targets)
+
+    gradient_logging_checks(step, global_max_targets, predicted_targets, target_mask, context_mask, loss, RANK)
 
     logi(f"Step {step} - K: loss={loss.item():.4f}", RANK)
 

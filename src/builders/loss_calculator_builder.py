@@ -14,14 +14,19 @@ class L2LossCalculator:
             predicted_embeddings: Tensor of shape (batch_size, num_targets, embedding_dim)
             target_embeddings: Tensor of shape (batch_size, num_targets, embedding_dim)
         Returns:
-            Scalar loss
+            Scalar loss with gradients
         """
-        if predicted_embeddings is None or predicted_embeddings.numel() == 0:
-            raise ValueError("predicted_embeddings is empty")
+        if predicted_embeddings is None or target_embeddings is None:
+            raise ValueError("Embeddings cannot be None")
         
-        if target_embeddings is None or target_embeddings.numel() == 0:
-            raise ValueError("target_embeddings is empty")
-
+        # Handle empty tensor case (num_targets = 0)
+        if predicted_embeddings.numel() == 0:
+            if predicted_embeddings.requires_grad:
+                return (predicted_embeddings ** 2).sum() * 0.0
+            else:
+                return torch.tensor(0.0, device=predicted_embeddings.device, 
+                                   dtype=predicted_embeddings.dtype)
+        
         return self.loss_fn(predicted_embeddings, target_embeddings)
 
 

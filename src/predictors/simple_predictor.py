@@ -23,7 +23,7 @@ class SimplePredictor(nn.Module):
         context_repr: torch.Tensor, 
         target_mask: torch.Tensor, 
         context_mask: torch.Tensor,
-        num_targets: int  # ← Accept pre-computed global max
+        num_targets: int
     ) -> torch.Tensor:
         """
         Args:
@@ -33,34 +33,24 @@ class SimplePredictor(nn.Module):
             num_targets: Pre-computed global max targets across all ranks
 
         Returns:
-            predictions: [B, num_targets, D]
+            predictions: [B, num_targets, D] with gradients
         """
         B, L, D = context_repr.shape
-        device = context_repr.device
         dtype = context_repr.dtype
 
+        # Vectorized context mean computation
+        context_sum = (context_repr * context_mask.unsqueeze(-1)).sum(dim=1)  # [B, D]
+        context_count = context_mask.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
+        context_mean = (context_sum / context_count).to(dtype=dtype)  # [B, D]
+        
+        # Project (maintains gradients)
+        projected = self.proj(context_mean)  # [B, D]
+        
         if num_targets == 0:
-            return torch.zeros(B, 1, D, device=device, dtype=dtype)
-
-        predictions = torch.zeros(B, num_targets, D, device=device, dtype=dtype)
-
-        for i in range(B):
-            num_tgt = int(target_mask[i].sum().item())
-            num_context = context_mask[i].sum()
-
-            # Calculate context mean
-            if num_context > 0:
-                context_sum = context_repr[i].sum(dim=0)
-                context_mean = context_sum / num_context
-            else:
-                context_mean = torch.zeros(D, device=device, dtype=dtype)
-
-            # ALWAYS call self.proj for synchronization
-            pred = self.proj(context_mean.unsqueeze(0))  # [1, D]
-            
-            # Only fill if this sample has targets
-            if num_tgt > 0:
-                repeated_pred = pred.repeat(num_tgt, 1)
-                predictions[i, :num_tgt, :] = repeated_pred
-
+            # Empty tensor with computation graph
+            return projected.unsqueeze(1)[:, :0, :]  # [B, 0, D]
+        
+        # Expand to target positions (maintains gradients)
+        predictions = projected.unsqueeze(1).expand(B, num_targets, D).contiguous()
+        
         return predictions

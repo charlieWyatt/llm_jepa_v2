@@ -4,6 +4,7 @@ from src.logging.logger import Logger
 from typing import Optional, Any, Dict, Union
 import torch
 import os
+from datetime import datetime
 
 # Global reference to avoid repeated lookups
 _logger_instance: Optional[Logger] = None
@@ -85,45 +86,43 @@ def training_loop_log(
 def save_checkpoint(
     checkpoint_dir: str,
     step: int,
-    engine: Any,
-    optimizer: Any,
+    engine,  # This could be DeepSpeed engine or Accelerate-unwrapped model
+    optimizer,
     loss: float,
-    config: Union[Dict[str, Any], Any],
+    config: Dict[str, Any],
     rank: int,
     is_final: bool = False
 ):
-    """
-    Save training checkpoint (only on rank 0).
-
-    Args:
-        checkpoint_dir: Directory to save checkpoints
-        step: Current training step
-        engine: DeepSpeed engine
-        optimizer: Optimizer instance
-        loss: Current loss value
-        config: Configuration dictionary or TypedDict
-        rank: GPU rank
-        is_final: Whether this is the final checkpoint
-    """
+    """Save checkpoint - works with both DeepSpeed and Accelerate."""
     if rank != 0:
         return
-
-    logger = get_logger(rank)
-
+    
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     checkpoint_name = "checkpoint_final.pt" if is_final else f"checkpoint_step_{step}.pt"
     checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
-
-    logger.log_only_one_gpu(f"Saving checkpoint to {checkpoint_path}")
-
-    torch.save({
+    
+    print(f"Saving checkpoint to {checkpoint_path}")
+    
+    # Handle both DeepSpeed engine and Accelerate unwrapped model
+    if hasattr(engine, 'module'):
+        # DeepSpeed engine
+        model_state = engine.module.state_dict()
+    else:
+        # Accelerate unwrapped model or regular PyTorch model
+        model_state = engine.state_dict()
+    
+    checkpoint = {
         'step': step,
-        'model_state_dict': engine.module.state_dict(),
+        'model_state_dict': model_state,
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
         'config': config,
-    }, checkpoint_path)
+    }
+    
+    torch.save(checkpoint, checkpoint_path)
+    print(f"✓ Checkpoint saved successfully to {checkpoint_path}")
 
-    logger.log_only_one_gpu("Checkpoint saved successfully.")
 
 
 def calculate_gradient_norm(model: Any) -> float:
