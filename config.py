@@ -48,7 +48,7 @@ STRATEGY_CONSTS: StrategyConfig = {
     "TARGET_MODEL_ID": "allenai/longformer-base-4096",
     "DEFAULT_EMA_DECAY": 0.99,
     "BATCH_SIZE": 2,
-    "MAX_STEPS": 10000,
+    "MAX_STEPS": None,
     "CHECKPOINT_INTERVAL": None,
     "LOG_INTERVAL": 10,
     "WARMUP_STEPS": 500,

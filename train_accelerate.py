@@ -33,6 +33,8 @@ def validate_token_length(token_ids):
         return token_ids[:max_allowed_tokens]
     return token_ids
 
+
+
 # ============================================
 # ACCELERATE INITIALIZATION (replaces all manual DeepSpeed setup)
 # ============================================
@@ -172,7 +174,8 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 log_once("Starting training loop...", RANK)
 
 for step, token_batch in enumerate(dataloader, start=1):
-    if step > STRATEGY_CONSTS['MAX_STEPS']:
+    max_steps = STRATEGY_CONSTS.get('MAX_STEPS')
+    if max_steps is not None and step > max_steps:
         break
 
     logi(f"Step {step} - START", RANK)
@@ -307,6 +310,14 @@ for step, token_batch in enumerate(dataloader, start=1):
             num_targets=int(target_mask.sum().item()),
             rank=RANK
         )
+        accelerator.log({
+            "train/loss": loss.item(),
+            "train/learning_rate": current_lr,
+            "train/grad_norm": total_norm,
+            "train/batch_size": B,
+            "train/num_patches": L_patches,
+            "train/num_targets": int(target_mask.sum().item()),
+        }, step=step)
 
     # Checkpointing
     if STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] and step % STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] == 0:
@@ -324,6 +335,7 @@ for step, token_batch in enumerate(dataloader, start=1):
             )
 
 log_once("Training loop finished.", RANK)
+accelerator.end_training()
 
 # Final checkpoint
 accelerator.wait_for_everyone()
