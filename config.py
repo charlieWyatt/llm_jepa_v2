@@ -29,6 +29,7 @@ class StrategyConfig(TypedDict):
     BATCH_SIZE: int
     MAX_STEPS: int
     CHECKPOINT_INTERVAL: int
+    CHECKPOINT_DIR: str
     LOG_INTERVAL: int
     WARMUP_STEPS: int
     LEARNING_RATE: float
@@ -38,7 +39,7 @@ class StrategyConfig(TypedDict):
 STRATEGY_CONSTS: StrategyConfig = {
     "TRAINING_DATASET": "dolma_sample",
     "PATCH_STRATEGY": "mean",  # "mean" or "max" pooling
-    "PATCH_SIZE": 4,  # Number of tokens to aggregate into one patch
+    "PATCH_SIZE": 2,  # Number of tokens to aggregate into one patch
     "MASK_STRATEGY": "random",
     "CONTEXT_STRATEGY": "random",
     "CONTEXT_ENCODER": "longformer",
@@ -49,7 +50,8 @@ STRATEGY_CONSTS: StrategyConfig = {
     "DEFAULT_EMA_DECAY": 0.99,
     "BATCH_SIZE": 2,
     "MAX_STEPS": None,
-    "CHECKPOINT_INTERVAL": None,
+    "CHECKPOINT_INTERVAL": 10000,
+    "CHECKPOINT_DIR": "/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa",
     "LOG_INTERVAL": 10,
     "WARMUP_STEPS": 500,
     "LEARNING_RATE": 5e-4,

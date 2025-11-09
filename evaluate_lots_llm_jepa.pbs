@@ -1,0 +1,88 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q dgxa100
+#PBS -l walltime=24:00:00
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=32GB
+#PBS -l jobfs=50GB
+#PBS -l storage=gdata/oy87+scratch/oy87
+#PBS -N eval_jepa_all
+#PBS -o /home/561/cw9909/logs/eval_jepa_all.out
+#PBS -e /home/561/cw9909/logs/eval_jepa_all.err
+#PBS -M your.email@example.com
+#PBS -m abe
+
+# Set TMPDIR
+export TMPDIR=/scratch/oy87/cw9909/tmp
+
+# Change to working directory
+cd /home/561/cw9909
+
+# Load modules
+module load cuda/12.8.0
+
+# Activate conda environment
+source ~/.bashrc
+conda activate /g/data/oy87/cw9909/conda_envs/cw9909
+
+# Output directory for results
+RESULTS_DIR=/home/561/cw9909/eval_results
+mkdir -p $RESULTS_DIR/small_encoder
+mkdir -p $RESULTS_DIR/large_encoder
+
+CHECKPOINT_BASE=/g/data/oy87/cw9909/llm_jepa/checkpoints/patch_size_4
+
+echo "=========================================="
+echo "Evaluating All JEPA Checkpoints"
+echo "Started at $(date)"
+echo "=========================================="
+echo ""
+
+# Evaluate Small Encoder checkpoints
+echo "Evaluating Small Encoder Checkpoints..."
+for checkpoint in $CHECKPOINT_BASE/small_encoder/checkpoint_step_*.pt; do
+    step=$(basename $checkpoint | sed 's/checkpoint_step_//;s/.pt//')
+    echo "----------------------------------------"
+    echo "Evaluating Small Encoder - Step $step"
+    echo "----------------------------------------"
+    
+    python experiments/llm_jepa_v2/imdb_evaluate.py \
+        --model-type jepa \
+        --checkpoint $checkpoint \
+        --output-dir $RESULTS_DIR/small_encoder
+    
+    echo "Completed step $step at $(date)"
+    echo ""
+done
+
+# Evaluate Large Encoder checkpoints
+echo "Evaluating Large Encoder Checkpoints..."
+for checkpoint in $CHECKPOINT_BASE/large_encoder/checkpoint_step_*.pt; do
+    step=$(basename $checkpoint | sed 's/checkpoint_step_//;s/.pt//')
+    echo "----------------------------------------"
+    echo "Evaluating Large Encoder - Step $step"
+    echo "----------------------------------------"
+    
+    python experiments/llm_jepa_v2/imdb_evaluate.py \
+        --model-type jepa \
+        --checkpoint $checkpoint \
+        --output-dir $RESULTS_DIR/large_encoder
+    
+    echo "Completed step $step at $(date)"
+    echo ""
+done
+
+echo ""
+echo "=========================================="
+echo "All Evaluations Completed at $(date)"
+echo "=========================================="
+
+# List results
+echo ""
+echo "Small Encoder Results:"
+ls -lh $RESULTS_DIR/small_encoder/*.json 2>/dev/null || echo "No results found"
+
+echo ""
+echo "Large Encoder Results:"
+ls -lh $RESULTS_DIR/large_encoder/*.json 2>/dev/null || echo "No results found"

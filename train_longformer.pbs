@@ -1,0 +1,29 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q dgxa100
+#PBS -l walltime=12:00:00
+#PBS -l ncpus=64
+#PBS -l ngpus=4
+#PBS -l mem=64GB
+#PBS -l jobfs=200GB
+#PBS -l storage=gdata/oy87+scratch/oy87
+#PBS -N longformer_training
+#PBS -o /home/561/cw9909/logs/train_longformer_long.out
+#PBS -e /home/561/cw9909/logs/train_longformer_long.err
+#PBS -M your.email@example.com
+#PBS -m abe
+
+# Change to working directory
+cd /home/561/cw9909
+
+# Load modules
+module load cuda/12.8.0
+
+# Activate conda environment
+source ~/.bashrc
+conda activate /g/data/oy87/cw9909/conda_envs/cw9909
+
+# Run training
+accelerate launch --num_processes=4 /home/561/cw9909/experiments/llm_jepa_v2/train_longformer.py
+
+echo "Training completed at $(date)"

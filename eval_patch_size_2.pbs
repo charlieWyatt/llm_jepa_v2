@@ -1,0 +1,83 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q dgxa100
+#PBS -l walltime=24:00:00
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=32GB
+#PBS -l jobfs=50GB
+#PBS -l storage=gdata/oy87+scratch/oy87
+#PBS -N eval_jepa_patch2
+#PBS -o /home/561/cw9909/logs/eval_jepa_patch2.out
+#PBS -e /home/561/cw9909/logs/eval_jepa_patch2.err
+#PBS -M your.email@example.com
+#PBS -m abe
+
+# Set TMPDIR
+export TMPDIR=/scratch/oy87/cw9909/tmp
+
+# Change to working directory
+cd /home/561/cw9909
+
+# Load modules
+module load cuda/12.8.0
+
+# Activate conda environment
+source ~/.bashrc
+conda activate /g/data/oy87/cw9909/conda_envs/cw9909
+
+# Output directory for results
+RESULTS_DIR=/home/561/cw9909/eval_results
+mkdir -p $RESULTS_DIR/patch_size_2
+
+CHECKPOINT_BASE=/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2
+
+echo "=========================================="
+echo "Evaluating All JEPA Checkpoints (Patch Size 2)"
+echo "Started at $(date)"
+echo "=========================================="
+echo ""
+
+# Count total checkpoints
+TOTAL_CHECKPOINTS=$(ls $CHECKPOINT_BASE/checkpoint_step_*.pt | wc -l)
+echo "Found $TOTAL_CHECKPOINTS checkpoints to evaluate"
+echo ""
+
+# Counter for progress tracking
+COUNTER=0
+
+# Evaluate all checkpoints
+echo "Evaluating Patch Size 2 Checkpoints..."
+for checkpoint in $CHECKPOINT_BASE/checkpoint_step_*.pt; do
+    COUNTER=$((COUNTER + 1))
+    step=$(basename $checkpoint | sed 's/checkpoint_step_//;s/.pt//')
+    
+    echo "----------------------------------------"
+    echo "[$COUNTER/$TOTAL_CHECKPOINTS] Evaluating Step $step"
+    echo "----------------------------------------"
+    
+    python experiments/llm_jepa_v2/imdb_evaluate.py \
+        --model-type jepa \
+        --checkpoint $checkpoint \
+        --output-dir $RESULTS_DIR/patch_size_2 \
+        --output-name "step_${step}_results.json"
+    
+    echo "Completed step $step at $(date)"
+    echo "Progress: $COUNTER/$TOTAL_CHECKPOINTS"
+    echo ""
+done
+
+echo ""
+echo "=========================================="
+echo "All Evaluations Completed at $(date)"
+echo "=========================================="
+
+# Generate summary table and plots
+echo ""
+echo "Generating analysis..."
+python /home/561/cw9909/scripts/analyze_patch2_results.py \
+    --results-dir $RESULTS_DIR/patch_size_2 \
+    --output-dir $RESULTS_DIR/patch_size_2_analysis
+
+echo ""
+echo "Analysis complete. Results saved to: $RESULTS_DIR/patch_size_2_analysis"

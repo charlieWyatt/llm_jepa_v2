@@ -18,7 +18,8 @@ from transformers import (
 MODEL_OR_PATH = "/g/data/oy87/cw9909/hf_models/allenai_longformer-base-4096"
 OUTPUT_DIR = "/g/data/oy87/cw9909/longformer_mlm_ckpts"
 FINAL_MODEL_DIR = "/g/data/oy87/cw9909/longformer_mlm_final"
-MAX_STEPS = None
+CHECKPOINT_DIR = "/g/data/oy87/cw9909/llm_jepa/checkpoints/longformer"
+MAX_STEPS = 9999999999999
 NUM_EPOCHS = 1
 BLOCK_SIZE = 4096
 
@@ -62,15 +63,15 @@ data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, m
 
 # Training arguments for 4 GPUs
 args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
+    output_dir=CHECKPOINT_DIR,
     per_device_train_batch_size=2,
     gradient_accumulation_steps=4,
     learning_rate=5e-5,
-    max_steps=MAX_STEPS,
     warmup_steps=500,
     logging_steps=50,
-    save_steps=2500,
+    save_steps=3000,
     save_total_limit=1,
+    max_steps=MAX_STEPS,
     num_train_epochs=NUM_EPOCHS,
     bf16=True,
     dataloader_num_workers=4,

@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q dgxa100
+#PBS -l walltime=1:00:00
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=32GB
+#PBS -l jobfs=50GB
+#PBS -l storage=gdata/oy87+scratch/oy87
+#PBS -N eval_longformer
+#PBS -o /home/561/cw9909/logs/eval_longformer.out
+#PBS -e /home/561/cw9909/logs/eval_longformer.err
+#PBS -M your.email@example.com
+#PBS -m abe
+
+# Set TMPDIR
+export TMPDIR=/scratch/oy87/cw9909/tmp
+
+# Change to working directory
+cd /home/561/cw9909
+
+# Load modules
+module load cuda/12.8.0
+
+# Activate conda environment
+source ~/.bashrc
+conda activate /g/data/oy87/cw9909/conda_envs/cw9909
+
+# Output directory for results
+RESULTS_DIR=/home/561/cw9909/eval_results
+mkdir -p $RESULTS_DIR
+
+echo "=========================================="
+echo "Evaluating Longformer checkpoint 20000"
+echo "Started at $(date)"
+echo "=========================================="
+echo ""
+
+# Evaluate Longformer
+python experiments/llm_jepa_v2/imdb_evaluate.py \
+    --model-type longformer \
+    --checkpoint /g/data/oy87/cw9909/llm_jepa/checkpoints/longformer/checkpoint-20000 \
+    --output-dir $RESULTS_DIR
+
+echo ""
+echo "=========================================="
+echo "Evaluation completed at $(date)"
+echo "=========================================="
+echo ""
+echo "Results saved to: $RESULTS_DIR/longformer_step_20000_imdb_results.json"

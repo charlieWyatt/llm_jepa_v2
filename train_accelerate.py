@@ -35,33 +35,6 @@ def validate_token_length(token_ids):
         return token_ids[:max_allowed_tokens]
     return token_ids
 
-def count_dataset_size(tokenizer, batch_size=100, max_count=None):
-    """Count the total number of samples in the dataset."""
-    print("Counting dataset size...", end='', flush=True)
-    
-    class CountTokenizer:
-        def __init__(self, tok):
-            self.tokenizer = tok
-        
-        def create_patches(self, text: str):
-            return self.tokenizer.tokenize(text)
-    
-    count_tokenizer = CountTokenizer(tokenizer)
-    count_dataloader = dataloader_builder(STRATEGY_CONSTS["TRAINING_DATASET"]).build(
-        count_tokenizer, batch_size=batch_size
-    )
-    
-    total_count = 0
-    for batch in count_dataloader:
-        batch_count = len([t for t in batch if len(t) > 0])
-        total_count += batch_count
-        
-        if max_count and total_count >= max_count:
-            break
-    
-    print(f" {total_count:,} samples found\n")
-    return total_count
-
 def format_time(seconds):
     """Format seconds into human-readable time string."""
     if seconds < 60:
@@ -72,6 +45,22 @@ def format_time(seconds):
         return f"{seconds/3600:.1f}h"
 
 # ============================================
+# TRAINING CONFIGURATION
+# ============================================
+
+# Training hyperparameters - ADJUST THESE
+NUM_EPOCHS = 1  # Set to 1 for single epoch
+GRADIENT_ACCUMULATION_STEPS = 4  # Increase effective batch size by 4x
+BASE_BATCH_SIZE = STRATEGY_CONSTS.get("BATCH_SIZE", 2)  # Per-GPU batch size
+EFFECTIVE_BATCH_SIZE = BASE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+
+log_once(f"Training Configuration:", 0)
+log_once(f"  Epochs: {NUM_EPOCHS}", 0)
+log_once(f"  Base batch size per GPU: {BASE_BATCH_SIZE}", 0)
+log_once(f"  Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}", 0)
+log_once(f"  Effective batch size per GPU: {EFFECTIVE_BATCH_SIZE}", 0)
+
+# ============================================
 # ACCELERATE INITIALIZATION
 # ============================================
 
@@ -80,7 +69,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 accelerator = Accelerator(
     mixed_precision="bf16",
-    gradient_accumulation_steps=1,
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,  # Use gradient accumulation
     log_with="tensorboard",
     project_dir=LOG_DIR
 )
@@ -105,14 +94,14 @@ if torch.cuda.is_available():
 log_once(json.dumps(STRATEGY_CONSTS), RANK)
 
 CONTEXT_ENCODER_CONFIG = {
-    "hidden_size": 384,
-    "num_layers": 6,
-    "attention_window": 128,
+    "hidden_size": 768,      # CHANGED: 384 → 768
+    "num_layers": 12,        # CHANGED: 6 → 12
+    "attention_window": 512, # CHANGED: 128 → 512 (match Longformer)
 }
 TARGET_ENCODER_CONFIG = {
-    "hidden_size": 384,
-    "num_layers": 2,
-    "attention_window": 256,
+    "hidden_size": 768,      # CHANGED: 384 → 768
+    "num_layers": 12,        # CHANGED: 2 → 12
+    "attention_window": 512, # CHANGED: 256 → 512
 }
 
 # ----------------------------
@@ -148,17 +137,17 @@ context_encoder = encoder_builder(STRATEGY_CONSTS["CONTEXT_ENCODER"]).build(
 )
 tokenizer = context_encoder.tokenizer
 
-# Count dataset size (only on rank 0)
-if RANK == 0:
-    TOTAL_DATASET_SIZE = count_dataset_size(tokenizer, batch_size=100, max_count=10000)
-else:
-    TOTAL_DATASET_SIZE = None
 
-# Broadcast to all ranks
-if IS_DIST:
-    size_tensor = torch.tensor([TOTAL_DATASET_SIZE or 0], device=device)
-    torch.distributed.broadcast(size_tensor, src=0)
-    TOTAL_DATASET_SIZE = int(size_tensor.item())
+# Calculate steps per epoch
+TOTAL_DATASET_SIZE = 9999999999999
+STEPS_PER_EPOCH = TOTAL_DATASET_SIZE // (BASE_BATCH_SIZE * WORLD_SIZE)
+MAX_STEPS = STEPS_PER_EPOCH * NUM_EPOCHS
+
+log_once(f"Dataset Configuration:", RANK)
+log_once(f"  Total dataset size: {TOTAL_DATASET_SIZE:,}", RANK)
+log_once(f"  Steps per epoch: {STEPS_PER_EPOCH:,}", RANK)
+log_once(f"  Total training steps: {MAX_STEPS:,}", RANK)
+log_once(f"  Total samples to process: {MAX_STEPS * BASE_BATCH_SIZE * WORLD_SIZE:,}", RANK)
 
 embedding_patcher = patcher_builder(
     STRATEGY_CONSTS["PATCH_STRATEGY"]).build(patch_size=STRATEGY_CONSTS["PATCH_SIZE"])
@@ -173,7 +162,7 @@ class TextTokenizer:
 
 text_tokenizer = TextTokenizer(tokenizer=context_encoder.tokenizer)
 dataloader = dataloader_builder(STRATEGY_CONSTS["TRAINING_DATASET"]).build(
-    text_tokenizer, batch_size=STRATEGY_CONSTS["BATCH_SIZE"])
+    text_tokenizer, batch_size=BASE_BATCH_SIZE)
 
 predictor = SimplePredictor(hidden_dim=CONTEXT_ENCODER_CONFIG["hidden_size"])
 
@@ -213,7 +202,8 @@ target_encoder = target_encoder.to(device)
 # ----------------------------
 # Training Loop
 # ----------------------------
-checkpoint_dir = STRATEGY_CONSTS.get("CHECKPOINT_DIR", "./checkpoints")
+base_checkpoint_dir = STRATEGY_CONSTS.get("CHECKPOINT_DIR", "./checkpoints")
+checkpoint_dir = os.path.join(base_checkpoint_dir, f"patch_size_{STRATEGY_CONSTS['PATCH_SIZE']}")
 os.makedirs(checkpoint_dir, exist_ok=True)
 
 log_once("Starting training loop...", RANK)
@@ -221,203 +211,265 @@ log_once("Starting training loop...", RANK)
 # Initialize progress tracking
 training_start = time.time()
 total_samples = 0
-pbar = tqdm(total=TOTAL_DATASET_SIZE, desc="Training", unit="samples", disable=(RANK != 0))
+global_step = 0
+epoch_samples = 0
 
-for step, token_batch in enumerate(dataloader, start=1):
-    step_start = time.time()
+# Outer loop for epochs
+for epoch in range(NUM_EPOCHS):
+    log_once(f"\n{'='*60}", RANK)
+    log_once(f"Starting Epoch {epoch + 1}/{NUM_EPOCHS}", RANK)
+    log_once(f"{'='*60}\n", RANK)
     
-    max_steps = STRATEGY_CONSTS.get('MAX_STEPS')
-    if max_steps is not None and step > max_steps:
-        break
-
-    logi(f"Step {step} - START", RANK)
+    epoch_start = time.time()
+    epoch_samples = 0
     
-    # Prepare batch
-    batch_token_ids = []
-    max_len = 0
+    pbar = tqdm(
+        desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", 
+        unit="steps", 
+        disable=(RANK != 0)
+    )
 
-    for tokens in token_batch:
-        if len(tokens) == 0:
+    for batch_idx, token_batch in enumerate(dataloader):
+        step_start = time.time()
+        global_step += 1
+        
+        if global_step % 1000 == 0:
+            logi(f"[Rank {RANK}] Step {global_step} - START", RANK)
+        
+        # Prepare batch
+        batch_token_ids = []
+        max_len = 0
+
+        for tokens in token_batch:
+            if len(tokens) == 0:
+                continue
+            token_ids = tokenizer.convert_tokens_to_ids(tokens)
+            token_ids = validate_token_length(token_ids)
+            batch_token_ids.append(token_ids)
+            max_len = max(max_len, len(token_ids))
+
+        if len(batch_token_ids) == 0:
             continue
-        token_ids = tokenizer.convert_tokens_to_ids(tokens)
-        token_ids = validate_token_length(token_ids)
-        batch_token_ids.append(token_ids)
-        max_len = max(max_len, len(token_ids))
 
-    if len(batch_token_ids) == 0:
-        continue
+        batch_size = len(batch_token_ids)
+        total_samples += batch_size
+        epoch_samples += batch_size
 
-    batch_size = len(batch_token_ids)
-    total_samples += batch_size
+        # Pad sequences
+        padded_ids = []
+        attention_masks = []
 
-    # Pad sequences
-    padded_ids = []
-    attention_masks = []
+        for token_ids in batch_token_ids:
+            pad_len = max_len - len(token_ids)
+            padded = token_ids + [tokenizer.pad_token_id] * pad_len
+            attn_mask = [1] * len(token_ids) + [0] * pad_len
+            padded_ids.append(padded)
+            attention_masks.append(attn_mask)
 
-    for token_ids in batch_token_ids:
-        pad_len = max_len - len(token_ids)
-        padded = token_ids + [tokenizer.pad_token_id] * pad_len
-        attn_mask = [1] * len(token_ids) + [0] * pad_len
-        padded_ids.append(padded)
-        attention_masks.append(attn_mask)
+        input_ids = torch.tensor(padded_ids, device=device)
+        attention_mask = torch.tensor(attention_masks, device=device).float()
 
-    input_ids = torch.tensor(padded_ids, device=device)
-    attention_mask = torch.tensor(attention_masks, device=device).float()
-
-    # Create patches
-    context_patch_embeds, patched_attention_mask = create_patched_embeddings(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        embedding_layer=accelerator.unwrap_model(context_encoder).get_input_embeddings(),
-        patcher=embedding_patcher,
-        patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
-    )
-
-    with torch.no_grad():
-        target_patch_embeds = context_patch_embeds.detach().clone()
-
-    # Create masks
-    B, L_patches, D = context_patch_embeds.shape
-    dummy_input_ids = torch.zeros(B, L_patches, dtype=torch.long, device=device)
-
-    mask_pair = context_target_creator.create_context_and_targets(
-        input_ids=dummy_input_ids,
-        attention_mask=patched_attention_mask
-    )
-
-    context_mask = mask_pair.context_mask
-    target_mask = mask_pair.target_masks[0]
-    context_mask = context_mask * (1 - target_mask)
-
-    # Global max targets
-    local_max_targets = int(target_mask.sum(dim=1).max().item())
-    if IS_DIST:
-        max_targets_tensor = torch.tensor(local_max_targets, device=device)
-        torch.distributed.all_reduce(max_targets_tensor, op=torch.distributed.ReduceOp.MAX)
-        global_max_targets = int(max_targets_tensor.item())
-    else:
-        global_max_targets = local_max_targets
-
-    # Forward pass
-    context_output = accelerator.unwrap_model(context_encoder).model(
-        inputs_embeds=context_patch_embeds,
-        attention_mask=patched_attention_mask,
-    )
-    context_repr = context_output.last_hidden_state
-
-    with torch.no_grad():
-        target_output = target_encoder.model(
-            inputs_embeds=target_patch_embeds,
-            attention_mask=patched_attention_mask,
+        # Create patches
+        context_patch_embeds, patched_attention_mask = create_patched_embeddings(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            embedding_layer=accelerator.unwrap_model(context_encoder).get_input_embeddings(),
+            patcher=embedding_patcher,
+            patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
         )
-        target_repr = target_output.last_hidden_state
 
-    # Apply masks
-    masked_context_repr = context_repr * context_mask.unsqueeze(-1)
+        with torch.no_grad():
+            target_patch_embeds = context_patch_embeds.detach().clone()
 
-    # Predict targets
-    predicted_targets = predictor(
-        masked_context_repr,
-        target_mask,
-        context_mask,
-        global_max_targets
-    )
+        # Create masks
+        B, L_patches, D = context_patch_embeds.shape
+        dummy_input_ids = torch.zeros(B, L_patches, dtype=torch.long, device=device)
 
-    # Extract ground truth
-    actual_targets = extract_target_representations(
-        target_repr,
-        target_mask,
-        global_max_targets
-    ).detach()
-
-    # Compute loss
-    loss = loss_calculator(predicted_targets, actual_targets)
-
-    if torch.isnan(loss) or torch.isinf(loss):
-        logi(f"Step {step} - WARNING: Invalid loss detected!", RANK)
-        continue
-
-    # Backward
-    accelerator.backward(loss)
-
-    # Calculate gradient norm
-    total_norm = calculate_gradient_norm(accelerator.unwrap_model(context_encoder))
-
-    # Step optimizers
-    optimizer.step()
-    predictor_optimizer.step()
-    optimizer.zero_grad()
-    predictor_optimizer.zero_grad()
-
-    target_encoder.update(accelerator.unwrap_model(context_encoder))
-
-    # Track timing
-    step_time = time.time() - step_start
-    elapsed = time.time() - training_start
-    throughput = total_samples / elapsed if elapsed > 0 else 0
-    
-    # Update progress bar
-    pbar.update(batch_size)
-    pbar.set_postfix({'loss': f'{loss.item():.4f}', 'samples/s': f'{throughput:.1f}'})
-
-    # Logging
-    if step % STRATEGY_CONSTS["LOG_INTERVAL"] == 0:
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        training_loop_log(
-            step=step,
-            max_steps=STRATEGY_CONSTS['MAX_STEPS'],
-            loss=loss.item(),
-            learning_rate=current_lr,
-            grad_norm=total_norm,
-            batch_size=B,
-            num_patches=L_patches,
-            num_targets=int(target_mask.sum().item()),
-            rank=RANK
+        mask_pair = context_target_creator.create_context_and_targets(
+            input_ids=dummy_input_ids,
+            attention_mask=patched_attention_mask
         )
-        
-        accelerator.log({
-            "train/loss": loss.item(),
-            "train/learning_rate": current_lr,
-            "train/grad_norm": total_norm,
-            "train/batch_size": B,
-            "train/num_patches": L_patches,
-            "train/num_targets": int(target_mask.sum().item()),
-            "train/step_time": step_time,
-            "train/throughput": throughput,
-            "train/total_samples": total_samples,
-        }, step=step)
 
-    # Checkpointing
-    if STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] and step % STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] == 0:
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            save_checkpoint(
-                checkpoint_dir=checkpoint_dir,
-                step=step,
-                engine=accelerator.unwrap_model(context_encoder),
-                optimizer=optimizer,
-                loss=loss.item(),
-                config=cast(Dict[str, Any], STRATEGY_CONSTS),
-                rank=RANK,
-                is_final=False
+        context_mask = mask_pair.context_mask
+        target_mask = mask_pair.target_masks[0]
+        context_mask = context_mask * (1 - target_mask)
+
+        # Global max targets
+        local_max_targets = int(target_mask.sum(dim=1).max().item())
+        if IS_DIST:
+            max_targets_tensor = torch.tensor(local_max_targets, device=device)
+            torch.distributed.all_reduce(max_targets_tensor, op=torch.distributed.ReduceOp.MAX)
+            global_max_targets = int(max_targets_tensor.item())
+        else:
+            global_max_targets = local_max_targets
+
+        # Use accelerator's context manager for gradient accumulation
+        with accelerator.accumulate(context_encoder, predictor):
+            # Forward pass
+            context_output = accelerator.unwrap_model(context_encoder).model(
+                inputs_embeds=context_patch_embeds,
+                attention_mask=patched_attention_mask,
+            )
+            context_repr = context_output.last_hidden_state
+
+            with torch.no_grad():
+                target_output = target_encoder.model(
+                    inputs_embeds=target_patch_embeds,
+                    attention_mask=patched_attention_mask,
+                )
+                target_repr = target_output.last_hidden_state
+
+            # Apply masks
+            masked_context_repr = context_repr * context_mask.unsqueeze(-1)
+
+            # Predict targets
+            predicted_targets = predictor(
+                masked_context_repr,
+                target_mask,
+                context_mask,
+                global_max_targets
             )
 
-pbar.close()
-log_once(f"Training finished. Total time: {format_time(time.time() - training_start)}", RANK)
+            # Extract ground truth
+            actual_targets = extract_target_representations(
+                target_repr,
+                target_mask,
+                global_max_targets
+            ).detach()
+
+            # Compute loss
+            loss = loss_calculator(predicted_targets, actual_targets)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                logi(f"Step {global_step} - WARNING: Invalid loss detected!", RANK)
+                continue
+
+            # Backward (handled by accelerator's accumulate context)
+            accelerator.backward(loss)
+
+            # Calculate gradient norm (only when we're about to step)
+            if accelerator.sync_gradients:
+                total_norm = calculate_gradient_norm(accelerator.unwrap_model(context_encoder))
+            else:
+                total_norm = 0.0
+
+            # Step optimizers (only happens when accumulation is complete)
+            optimizer.step()
+            predictor_optimizer.step()
+            optimizer.zero_grad()
+            predictor_optimizer.zero_grad()
+
+            # Update EMA target encoder (only on actual optimizer steps)
+            if accelerator.sync_gradients:
+                target_encoder.update(accelerator.unwrap_model(context_encoder))
+
+        # Track timing
+        step_time = time.time() - step_start
+        epoch_elapsed = time.time() - epoch_start
+        throughput = epoch_samples / epoch_elapsed if epoch_elapsed > 0 else 0
+        
+        # Update progress bar
+        pbar.update(1)
+        
+        # Calculate ETA for current epoch
+        steps_remaining = STEPS_PER_EPOCH - batch_idx - 1
+        if throughput > 0 and steps_remaining > 0:
+            samples_remaining = steps_remaining * BASE_BATCH_SIZE
+            eta_seconds = samples_remaining / throughput
+            eta_str = format_time(eta_seconds)
+        else:
+            eta_str = "?"
+
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}', 
+            'samples/s': f'{throughput:.1f}',
+            'ETA': eta_str
+        })
+
+        # Logging
+        if global_step % STRATEGY_CONSTS["LOG_INTERVAL"] == 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            training_loop_log(
+                step=global_step,
+                max_steps=MAX_STEPS,
+                loss=loss.item(),
+                learning_rate=current_lr,
+                grad_norm=total_norm,
+                batch_size=B,
+                num_patches=L_patches,
+                num_targets=int(target_mask.sum().item()),
+                rank=RANK
+            )
+            
+            accelerator.log({
+                "train/loss": loss.item(),
+                "train/learning_rate": current_lr,
+                "train/grad_norm": total_norm,
+                "train/batch_size": B,
+                "train/num_patches": L_patches,
+                "train/num_targets": int(target_mask.sum().item()),
+                "train/step_time": step_time,
+                "train/throughput": throughput,
+                "train/total_samples": total_samples,
+                "train/epoch": epoch + 1,
+                "train/epoch_progress": batch_idx / STEPS_PER_EPOCH,
+            }, step=global_step)
+
+        # Checkpointing
+        if STRATEGY_CONSTS.get("CHECKPOINT_INTERVAL") and global_step % STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] == 0:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                save_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    step=global_step,
+                    engine=accelerator.unwrap_model(context_encoder),
+                    optimizer=optimizer,
+                    loss=loss.item(),
+                    config=cast(Dict[str, Any], {
+                        **STRATEGY_CONSTS,
+                        "epoch": epoch + 1,
+                        "epoch_step": batch_idx,
+                        "total_samples": total_samples,
+                    }),
+                    rank=RANK,
+                    is_final=False
+                )
+
+    pbar.close()
+    
+    epoch_time = time.time() - epoch_start
+    log_once(f"\nEpoch {epoch + 1} completed in {format_time(epoch_time)}", RANK)
+    log_once(f"Samples processed: {epoch_samples:,}", RANK)
+    log_once(f"Average throughput: {epoch_samples / epoch_time:.1f} samples/s\n", RANK)
+    
+    # Save checkpoint at end of epoch
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        save_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            step=global_step,
+            engine=accelerator.unwrap_model(context_encoder),
+            optimizer=optimizer,
+            loss=loss.item(),
+            config=cast(Dict[str, Any], {
+                **STRATEGY_CONSTS,
+                "epoch": epoch + 1,
+                "epoch_complete": True,
+                "total_samples": total_samples,
+            }),
+            rank=RANK,
+            is_final=(epoch == NUM_EPOCHS - 1)
+        )
+
+total_time = time.time() - training_start
+log_once(f"\n{'='*60}", RANK)
+log_once(f"Training Completed!", RANK)
+log_once(f"{'='*60}", RANK)
+log_once(f"Total epochs: {NUM_EPOCHS}", RANK)
+log_once(f"Total steps: {global_step:,}", RANK)
+log_once(f"Total samples: {total_samples:,}", RANK)
+log_once(f"Total time: {format_time(total_time)}", RANK)
+log_once(f"Average throughput: {total_samples / total_time:.1f} samples/s", RANK)
 
 accelerator.end_training()
-
-# Final checkpoint
-accelerator.wait_for_everyone()
-if accelerator.is_main_process:
-    save_checkpoint(
-        checkpoint_dir=checkpoint_dir,
-        step=step,
-        engine=accelerator.unwrap_model(context_encoder),
-        optimizer=optimizer,
-        loss=loss.item(),
-        config=cast(Dict[str, Any], STRATEGY_CONSTS),
-        rank=RANK,
-        is_final=True
-    )
