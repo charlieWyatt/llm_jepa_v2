@@ -146,42 +146,42 @@ class JEPAWrapper(ModelWrapper):
         return f"jepa_step_{step}"
     
     def extract_features(self, texts: List[str], config: EvalConfig) -> np.ndarray:
-    features = []
+        features = []
 
-    with torch.no_grad():
-        for i in tqdm(range(0, len(texts), config.batch_size), desc="Extracting features"):
-            batch = texts[i:i+config.batch_size]
+        with torch.no_grad():
+            for i in tqdm(range(0, len(texts), config.batch_size), desc="Extracting features"):
+                batch = texts[i:i+config.batch_size]
 
-            tokens = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=config.max_length,
-                return_tensors="pt"
-            ).to(self.device)
+                tokens = self.tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=config.max_length,
+                    return_tensors="pt"
+                ).to(self.device)
 
-            # Forward pass for JEPA
-            outputs = self.model.model(
-                input_ids=None,
-                inputs_embeds=self.model.model.embeddings(
-                    tokens.input_ids
-                ),
-                attention_mask=tokens.attention_mask,
-                output_hidden_states=True
-            )
+                # Forward pass for JEPA
+                outputs = self.model.model(
+                    input_ids=None,
+                    inputs_embeds=self.model.model.embeddings(
+                        tokens.input_ids
+                    ),
+                    attention_mask=tokens.attention_mask,
+                    output_hidden_states=True
+                )
 
-            # Use last hidden layer
-            hidden = outputs.hidden_states[-1]
+                # Use last hidden layer
+                hidden = outputs.hidden_states[-1]
 
-            # Mean pool like Longformer
-            mask = tokens.attention_mask.unsqueeze(-1)
-            summed = (hidden * mask).sum(dim=1)
-            denom = mask.sum(dim=1)
-            pooled = summed / denom
+                # Mean pool like Longformer
+                mask = tokens.attention_mask.unsqueeze(-1)
+                summed = (hidden * mask).sum(dim=1)
+                denom = mask.sum(dim=1)
+                pooled = summed / denom
 
-            features.append(pooled.cpu().numpy())
+                features.append(pooled.cpu().numpy())
 
-    return np.vstack(features)
+        return np.vstack(features)
     
     def load(self):
         """Load JEPA model and tokenizer"""
