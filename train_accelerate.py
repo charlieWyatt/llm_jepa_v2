@@ -22,6 +22,10 @@ from src.maskers.context_target_creator import ContextTargetCreator
 from config import STRATEGY_CONSTS
 from src.logging.logging_helpers import logi, log_once, get_logger, training_loop_log, save_checkpoint, calculate_gradient_norm
 from src.predictors.simple_predictor import SimplePredictor
+from dataclasses import dataclass
+from typing import List, Tuple
+import heapq
+from src.experiment_trackers.experiment_tracker import create_tracker, ExperimentTracker
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -43,6 +47,222 @@ def format_time(seconds):
         return f"{seconds/60:.1f}m"
     else:
         return f"{seconds/3600:.1f}h"
+
+# LOGGING HELPERS
+# ============================================
+# SAMPLE TRACKING FOR LOGGING
+# ============================================
+
+@dataclass
+class TrainingSample:
+    """Container for a training sample with its loss."""
+    step: int
+    loss: float
+    text: str
+    num_patches: int
+    num_targets: int
+    # NEW: Add mask and patch information
+    context_patches: str  # Description of context patches
+    target_patches: str   # Description of target patches
+    patch_texts: List[str]  # Individual patch texts
+    
+    def __lt__(self, other):
+        """For heap comparison - lower loss is better."""
+        return self.loss < other.loss
+
+
+class SampleTracker:
+    """Tracks best and worst training samples during training."""
+    
+    def __init__(self, k: int = 5):
+        """
+        Args:
+            k: Number of best/worst samples to track
+        """
+        self.k = k
+        # Min heap for best samples (smallest losses)
+        self.best_samples: List[TrainingSample] = []
+        # Max heap for worst samples (largest losses) - negate for max heap
+        self.worst_samples: List[Tuple[float, TrainingSample]] = []
+    
+    def update(self, sample: TrainingSample):
+        """Update best and worst samples with new sample."""
+        # Update best samples (min heap)
+        if len(self.best_samples) < self.k:
+            heapq.heappush(self.best_samples, sample)
+        elif sample.loss < self.best_samples[0].loss:
+            heapq.heapreplace(self.best_samples, sample)
+        
+        # Update worst samples (max heap using negated loss)
+        neg_loss_sample = (-sample.loss, sample)
+        if len(self.worst_samples) < self.k:
+            heapq.heappush(self.worst_samples, neg_loss_sample)
+        elif -sample.loss > self.worst_samples[0][0]:
+            heapq.heapreplace(self.worst_samples, neg_loss_sample)
+    
+    def get_best_samples(self) -> List[TrainingSample]:
+        """Get k best samples sorted by loss (ascending)."""
+        return sorted(self.best_samples, key=lambda x: x.loss)
+    
+    def get_worst_samples(self) -> List[TrainingSample]:
+        """Get k worst samples sorted by loss (descending)."""
+        return sorted([s for _, s in self.worst_samples], key=lambda x: x.loss, reverse=True)
+
+
+def log_sample_analysis(
+    tracker: ExperimentTracker,
+    sample_tracker: SampleTracker,
+    tokenizer,
+    global_step: int,
+    rank: int
+):
+    """
+    Log best and worst training samples to the Experiment Tracker.
+    
+    Args:
+        accelerator: Accelerator instance
+        sample_tracker: SampleTracker with recorded samples
+        tokenizer: Tokenizer for decoding
+        global_step: Current training step
+        rank: Process rank
+    """
+    if rank != 0:
+        return
+    
+    best_samples = sample_tracker.get_best_samples()
+    worst_samples = sample_tracker.get_worst_samples()
+    
+    best_text = "# BEST TRAINING SAMPLES (Lowest Loss)\n\n"
+    for i, sample in enumerate(best_samples, 1):
+        best_text += f"## Sample {i} (Step {sample.step}, Loss: {sample.loss:.4f})\n"
+        best_text += f"**Patches:** {sample.num_patches} | **Targets:** {sample.num_targets}\n\n"
+        best_text += f"**Original Text:**\n```\n{sample.text[:300]}...\n```\n\n"
+        best_text += f"**Context Patches:** {sample.context_patches}\n\n"
+        best_text += f"**Target Patches:** {sample.target_patches}\n\n"
+        if sample.patch_texts:
+            best_text += "**Patch Breakdown:**\n"
+            for j, patch in enumerate(sample.patch_texts[:10]):  # Show first 10 patches
+                best_text += f"  - Patch {j}: `{patch[:50]}...`\n"
+            best_text += "\n"
+        best_text += "---\n\n"
+    
+    worst_text = "# WORST TRAINING SAMPLES (Highest Loss)\n\n"
+    for i, sample in enumerate(worst_samples, 1):
+        worst_text += f"## Sample {i} (Step {sample.step}, Loss: {sample.loss:.4f})\n"
+        worst_text += f"**Patches:** {sample.num_patches} | **Targets:** {sample.num_targets}\n\n"
+        worst_text += f"**Original Text:**\n```\n{sample.text[:300]}...\n```\n\n"
+        worst_text += f"**Context Patches:** {sample.context_patches}\n\n"
+        worst_text += f"**Target Patches:** {sample.target_patches}\n\n"
+        if sample.patch_texts:
+            worst_text += "**Patch Breakdown:**\n"
+            for j, patch in enumerate(sample.patch_texts[:10]):  # Show first 10 patches
+                worst_text += f"  - Patch {j}: `{patch[:50]}...`\n"
+            worst_text += "\n"
+        worst_text += "---\n\n"
+    
+    tracker.log_text({
+        "samples/best_samples": best_text,
+        "samples/worst_samples": worst_text,
+    }, step=global_step)
+    
+    # Also log statistics
+    if best_samples:
+        avg_best_loss = sum(s.loss for s in best_samples) / len(best_samples)
+        tracker.log_metrics({"samples/avg_best_loss": avg_best_loss}, step=global_step)
+    
+    if worst_samples:
+        avg_worst_loss = sum(s.loss for s in worst_samples) / len(worst_samples)
+        tracker.log_metrics({"samples/avg_worst_loss": avg_worst_loss}, step=global_step)
+    
+    log_once(f"Logged {len(best_samples)} best and {len(worst_samples)} worst samples", rank)
+
+
+def reconstruct_text_from_batch(
+    token_batch: List[List[str]],
+    batch_idx: int,
+    tokenizer
+) -> str:
+    """
+    Reconstruct text from tokenized batch.
+    
+    Args:
+        token_batch: Batch of tokenized sequences
+        batch_idx: Index of sample in batch
+        tokenizer: Tokenizer for decoding
+    
+    Returns:
+        Reconstructed text string
+    """
+    if batch_idx >= len(token_batch):
+        return "[Sample index out of range]"
+    
+    tokens = token_batch[batch_idx]
+    # Convert tokens back to text
+    try:
+        text = tokenizer.convert_tokens_to_string(tokens)
+        return text
+    except:
+        # Fallback: just join tokens
+        return " ".join(tokens)
+
+
+def get_patch_texts(
+    tokens: List[str],
+    patch_size: int,
+    tokenizer
+) -> List[str]:
+    """
+    Break tokens into patches and convert to text.
+    
+    Args:
+        tokens: List of tokens
+        patch_size: Number of tokens per patch
+        tokenizer: Tokenizer for conversion
+    
+    Returns:
+        List of patch text strings
+    """
+    patches = []
+    for i in range(0, len(tokens), patch_size):
+        patch_tokens = tokens[i:i + patch_size]
+        try:
+            patch_text = tokenizer.convert_tokens_to_string(patch_tokens)
+        except:
+            patch_text = " ".join(patch_tokens)
+        patches.append(patch_text)
+    return patches
+
+
+def describe_mask(mask: torch.Tensor, patch_texts: List[str] = None) -> str:
+    """
+    Create human-readable description of a mask.
+    
+    Args:
+        mask: Binary mask tensor [L]
+        patch_texts: Optional list of patch texts
+    
+    Returns:
+        String description of mask
+    """
+    mask_np = mask.cpu().numpy()
+    masked_indices = [i for i, v in enumerate(mask_np) if v == 1]
+    
+    if len(masked_indices) == 0:
+        return "No patches selected"
+    
+    # Create description
+    desc = f"Indices: {masked_indices[:20]}"  # Show first 20
+    if len(masked_indices) > 20:
+        desc += f"... ({len(masked_indices)} total)"
+    
+    if patch_texts:
+        desc += "\nSelected patches:\n"
+        for idx in masked_indices[:5]:  # Show first 5
+            if idx < len(patch_texts):
+                desc += f"  [{idx}]: {patch_texts[idx][:30]}...\n"
+    
+    return desc
+
 
 # ============================================
 # TRAINING CONFIGURATION
@@ -67,16 +287,24 @@ log_once(f"  Effective batch size per GPU: {EFFECTIVE_BATCH_SIZE}", 0)
 LOG_DIR = "/g/data/oy87/cw9909/llm_jepa/logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# Initialize sample tracker
+sample_tracker = SampleTracker(k=5)
+SAMPLE_LOG_INTERVAL = 5000
+
 accelerator = Accelerator(
     mixed_precision="bf16",
-    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,  # Use gradient accumulation
-    log_with="tensorboard",
-    project_dir=LOG_DIR
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
 )
 
-accelerator.init_trackers(
+tracker = create_tracker(
+    backend=STRATEGY_CONSTS["EXPERIMENT_TRACKER"],
+    accelerator=accelerator,
+    log_dir=LOG_DIR
+)
+
+tracker.initialize(
     project_name="llm_jepa_training",
-    config=STRATEGY_CONSTS,
+    config=STRATEGY_CONSTS
 )
 
 # Get distributed info from Accelerator
@@ -111,24 +339,34 @@ log_once("Building components...", RANK)
 loss_calculator = loss_calculator_builder(
     STRATEGY_CONSTS["LOSS_CALCULATOR"]).build()
 
+# Context generator (configurable)
 if STRATEGY_CONSTS["CONTEXT_STRATEGY"] == "random":
-    context_generator = RandomMaskGenerator(mask_ratio=0.6)
+    context_generator = RandomMaskGenerator(
+        mask_ratio=STRATEGY_CONSTS["CONTEXT_MASK_RATIO"]
+    )
 elif STRATEGY_CONSTS["CONTEXT_STRATEGY"] == "block":
-    context_generator = BlockMaskGenerator(span_length=50)
+    context_generator = BlockMaskGenerator(
+        span_ratio=STRATEGY_CONSTS["CONTEXT_MASK_RATIO"]  # Now using ratio!
+    )
 else:
     raise ValueError(f"Unknown context strategy: {STRATEGY_CONSTS['CONTEXT_STRATEGY']}")
 
+# Target generator (configurable)
 if STRATEGY_CONSTS["MASK_STRATEGY"] == "random":
-    target_generator = RandomMaskGenerator(mask_ratio=0.15)
+    target_generator = RandomMaskGenerator(
+        mask_ratio=STRATEGY_CONSTS["TARGET_MASK_RATIO"]
+    )
 elif STRATEGY_CONSTS["MASK_STRATEGY"] == "block":
-    target_generator = BlockMaskGenerator(span_length=10)
+    target_generator = BlockMaskGenerator(
+        span_ratio=STRATEGY_CONSTS["TARGET_MASK_RATIO"]  # Now using ratio!
+    )
 else:
     raise ValueError(f"Unknown target strategy: {STRATEGY_CONSTS['MASK_STRATEGY']}")
 
 context_target_creator = ContextTargetCreator(
     context_generator=context_generator,
     target_generator=target_generator,
-    num_targets=1
+    num_targets=STRATEGY_CONSTS["NUM_TARGETS"]
 )
 
 context_encoder = encoder_builder(STRATEGY_CONSTS["CONTEXT_ENCODER"]).build(
@@ -235,6 +473,8 @@ for epoch in range(NUM_EPOCHS):
         
         if global_step % 1000 == 0:
             logi(f"[Rank {RANK}] Step {global_step} - START", RANK)
+
+        original_token_batch = token_batch
         
         # Prepare batch
         batch_token_ids = []
@@ -344,6 +584,40 @@ for epoch in range(NUM_EPOCHS):
                 logi(f"Step {global_step} - WARNING: Invalid loss detected!", RANK)
                 continue
 
+            # ============================================
+            # TRACK SAMPLES (MOVED OUTSIDE LOG_INTERVAL)
+            # ============================================
+            if RANK == 0:  # Only track on main process
+                # Track each sample in the batch
+                for i in range(B):
+                    sample_text = reconstruct_text_from_batch(original_token_batch, i, tokenizer)
+                    
+                    # Get patch breakdown
+                    if i < len(original_token_batch):
+                        patch_texts = get_patch_texts(
+                            original_token_batch[i],
+                            STRATEGY_CONSTS["PATCH_SIZE"],
+                            tokenizer
+                        )
+                    else:
+                        patch_texts = []
+                    
+                    # Describe masks for this sample
+                    context_desc = describe_mask(context_mask[i], patch_texts)
+                    target_desc = describe_mask(target_mask[i], patch_texts)
+                    
+                    sample = TrainingSample(
+                        step=global_step,
+                        loss=loss.item(),
+                        text=sample_text,
+                        num_patches=L_patches,
+                        num_targets=int(target_mask[i].sum().item()),
+                        context_patches=context_desc,
+                        target_patches=target_desc,
+                        patch_texts=patch_texts
+                    )
+                    sample_tracker.update(sample)
+
             # Backward (handled by accelerator's accumulate context)
             accelerator.backward(loss)
 
@@ -386,7 +660,6 @@ for epoch in range(NUM_EPOCHS):
             'ETA': eta_str
         })
 
-        # Logging
         if global_step % STRATEGY_CONSTS["LOG_INTERVAL"] == 0:
             current_lr = optimizer.param_groups[0]['lr']
             
@@ -402,7 +675,7 @@ for epoch in range(NUM_EPOCHS):
                 rank=RANK
             )
             
-            accelerator.log({
+            tracker.log_metrics({
                 "train/loss": loss.item(),
                 "train/learning_rate": current_lr,
                 "train/grad_norm": total_norm,
@@ -415,6 +688,18 @@ for epoch in range(NUM_EPOCHS):
                 "train/epoch": epoch + 1,
                 "train/epoch_progress": batch_idx / STEPS_PER_EPOCH,
             }, step=global_step)
+
+        # ============================================
+        # LOG SAMPLE ANALYSIS
+        # ============================================
+        if global_step % SAMPLE_LOG_INTERVAL == 0:
+            log_sample_analysis(
+                tracker=tracker,
+                sample_tracker=sample_tracker,
+                tokenizer=tokenizer,
+                global_step=global_step,
+                rank=RANK
+            )
 
         # Checkpointing
         if STRATEGY_CONSTS.get("CHECKPOINT_INTERVAL") and global_step % STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] == 0:
@@ -472,4 +757,4 @@ log_once(f"Total samples: {total_samples:,}", RANK)
 log_once(f"Total time: {format_time(total_time)}", RANK)
 log_once(f"Average throughput: {total_samples / total_time:.1f} samples/s", RANK)
 
-accelerator.end_training()
+tracker.finalize()

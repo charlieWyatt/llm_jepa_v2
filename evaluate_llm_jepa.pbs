@@ -7,9 +7,9 @@
 #PBS -l mem=32GB
 #PBS -l jobfs=50GB
 #PBS -l storage=gdata/oy87+scratch/oy87
-#PBS -N eval_jepa_470k
-#PBS -o /home/561/cw9909/logs/eval_jepa_470k.out
-#PBS -e /home/561/cw9909/logs/eval_jepa_470k.err
+#PBS -N eval_jepa_390k
+#PBS -o /home/561/cw9909/logs/eval_jepa_390k.out
+#PBS -e /home/561/cw9909/logs/eval_jepa_390k.err
 #PBS -M your.email@example.com
 #PBS -m abe
 
@@ -31,15 +31,15 @@ RESULTS_DIR=/home/561/cw9909/eval_results
 mkdir -p $RESULTS_DIR
 
 echo "=========================================="
-echo "Evaluating JEPA checkpoint step 470000"
+echo "Evaluating JEPA checkpoint step 390000"
 echo "Started at $(date)"
 echo "=========================================="
 echo ""
 
-# Evaluate JEPA checkpoint
+# Evaluate JEPA checkpoint - CORRECTED PATH
 python experiments/llm_jepa_v2/imdb_evaluate.py \
     --model-type jepa \
-    --checkpoint /g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/checkpoint_step_470000.pt \
+    --checkpoint /g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt \
     --output-dir $RESULTS_DIR
 
 echo ""
@@ -47,4 +47,4 @@ echo "=========================================="
 echo "Evaluation completed at $(date)"
 echo "=========================================="
 echo ""
-echo "Results saved to: $RESULTS_DIR/jepa_step_470000_imdb_results.json"
+echo "Results saved to: $RESULTS_DIR"

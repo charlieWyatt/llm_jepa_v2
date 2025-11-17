@@ -138,6 +138,50 @@ class LongformerWrapper(ModelWrapper):
 # ============================================
 class JEPAWrapper(ModelWrapper):
     """Wrapper for LLM-JEPA models"""
+
+    def get_model_name(self) -> str:
+        path = Path(self.checkpoint_path)
+        name = path.stem
+        step = name.split("_")[-1]
+        return f"jepa_step_{step}"
+    
+    def extract_features(self, texts: List[str], config: EvalConfig) -> np.ndarray:
+    features = []
+
+    with torch.no_grad():
+        for i in tqdm(range(0, len(texts), config.batch_size), desc="Extracting features"):
+            batch = texts[i:i+config.batch_size]
+
+            tokens = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=config.max_length,
+                return_tensors="pt"
+            ).to(self.device)
+
+            # Forward pass for JEPA
+            outputs = self.model.model(
+                input_ids=None,
+                inputs_embeds=self.model.model.embeddings(
+                    tokens.input_ids
+                ),
+                attention_mask=tokens.attention_mask,
+                output_hidden_states=True
+            )
+
+            # Use last hidden layer
+            hidden = outputs.hidden_states[-1]
+
+            # Mean pool like Longformer
+            mask = tokens.attention_mask.unsqueeze(-1)
+            summed = (hidden * mask).sum(dim=1)
+            denom = mask.sum(dim=1)
+            pooled = summed / denom
+
+            features.append(pooled.cpu().numpy())
+
+    return np.vstack(features)
     
     def load(self):
         """Load JEPA model and tokenizer"""
@@ -147,18 +191,33 @@ class JEPAWrapper(ModelWrapper):
         from src.builders.encoder_builder import encoder_builder
         from config import STRATEGY_CONSTS
         
-        # Build encoder architecture
+        # Load checkpoint first to inspect the model architecture
+        checkpoint = torch.load(self.checkpoint_path, map_location='cpu')
+        
+        # Infer model size from checkpoint weights
+        # Check the embedding layer size to determine hidden_size
+        embedding_weight_shape = checkpoint['model_state_dict']['model.embeddings.word_embeddings.weight'].shape
+        hidden_size = embedding_weight_shape[1]  # Second dimension is hidden_size
+        
+        # Count the number of layers by counting unique layer indices
+        num_layers = sum(1 for k in checkpoint['model_state_dict'].keys() 
+                        if 'model.encoder.layer.' in k and '.attention.self.query.weight' in k)
+        
+        print(f"  Detected from checkpoint: hidden_size={hidden_size}, num_layers={num_layers}")
+        
+        # Build encoder architecture with detected config
+        model_config = {
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "attention_window": 512,  # This was constant in your training
+        }
+        
         context_encoder = encoder_builder(STRATEGY_CONSTS["CONTEXT_ENCODER"]).build(
             model_id=STRATEGY_CONSTS["CONTEXT_MODEL_ID"],
-            config={
-                "hidden_size": 384,
-                "num_layers": 6,
-                "attention_window": 128,
-            }
+            config=model_config
         )
         
-        # Load checkpoint
-        checkpoint = torch.load(self.checkpoint_path, map_location='cpu')
+        # Load checkpoint weights
         context_encoder.load_state_dict(checkpoint['model_state_dict'])
         
         self.model = context_encoder
@@ -169,47 +228,6 @@ class JEPAWrapper(ModelWrapper):
         
         print(f"  Model loaded on {self.device}")
         print(f"  Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-    
-    def extract_features(self, texts: List[str], config: EvalConfig) -> np.ndarray:
-        """Extract features using mean pooling"""
-        features_list = []
-        
-        with torch.no_grad():
-            for i in tqdm(range(0, len(texts), config.batch_size), desc="Extracting features"):
-                batch_texts = texts[i:i + config.batch_size]
-                
-                # Tokenize
-                inputs = self.tokenizer(
-                    batch_texts,
-                    padding=True,
-                    truncation=True,
-                    max_length=config.max_length,
-                    return_tensors="pt"
-                ).to(self.device)
-                
-                # Forward pass
-                outputs = self.model.model(**inputs)
-                hidden_states = outputs.last_hidden_state
-                
-                # Mean pooling
-                attention_mask = inputs['attention_mask'].unsqueeze(-1)
-                masked_hidden = hidden_states * attention_mask
-                sum_hidden = masked_hidden.sum(dim=1)
-                sum_mask = attention_mask.sum(dim=1)
-                pooled_features = sum_hidden / sum_mask
-                
-                features_list.append(pooled_features.cpu().numpy())
-        
-        return np.vstack(features_list)
-    
-    def get_model_name(self) -> str:
-        """Return model name from checkpoint path"""
-        # Extract step number from checkpoint filename
-        path = Path(self.checkpoint_path)
-        if "checkpoint_step_" in path.name:
-            step = path.stem.split("_")[-1]
-            return f"jepa_step_{step}"
-        return "jepa"
 
 
 # ============================================
