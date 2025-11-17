@@ -1,0 +1,64 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q dgxa100
+#PBS -l walltime=3:00:00
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=32GB
+#PBS -l jobfs=50GB
+#PBS -l storage=gdata/oy87+scratch/oy87
+#PBS -N glue_eval_jepa_390k
+#PBS -o /home/561/cw9909/logs/glue_eval_jepa_390k.out
+#PBS -e /home/561/cw9909/logs/glue_eval_jepa_390k.err
+#PBS -M your.email@example.com
+#PBS -m abe
+
+############################################
+# Setup
+############################################
+
+# Temporary space (scratch is fast, local to job)
+export TMPDIR=/scratch/oy87/cw9909/tmp
+mkdir -p $TMPDIR
+
+# Change to your working directory
+cd /home/561/cw9909
+
+# Load correct CUDA module
+module load cuda/12.8.0
+
+# Activate conda env
+source ~/.bashrc
+conda activate /g/data/oy87/cw9909/conda_envs/cw9909
+
+# Where to save evaluation outputs
+RESULTS_DIR=/home/561/cw9909/eval_results
+mkdir -p $RESULTS_DIR
+
+# Checkpoint path
+CHECKPOINT=/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt
+
+# Path to GLUE data
+export GLUE_DATA=/g/data/oy87/cw9909/glue_data
+
+echo "=========================================="
+echo "Running GLUE evaluation on JEPA checkpoint"
+echo "Checkpoint: $CHECKPOINT"
+echo "Started at: $(date)"
+echo "=========================================="
+echo ""
+
+############################################
+# Run GLUE evaluation
+############################################
+python experiments/llm_jepa_v2/glue_main.py \
+    --model-type jepa \
+    --checkpoint $CHECKPOINT \
+    --output-dir $RESULTS_DIR
+
+echo ""
+echo "=========================================="
+echo "GLUE Evaluation Complete"
+echo "Finished at: $(date)"
+echo "Results saved to: $RESULTS_DIR"
+echo "=========================================="

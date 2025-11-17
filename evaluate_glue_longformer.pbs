@@ -1,0 +1,64 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q dgxa100
+#PBS -l walltime=3:00:00
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=32GB
+#PBS -l jobfs=50GB
+#PBS -l storage=gdata/oy87+scratch/oy87
+#PBS -N glue_eval_longformer
+#PBS -o /home/561/cw9909/logs/glue_eval_longformer.out
+#PBS -e /home/561/cw9909/logs/glue_eval_longformer.err
+#PBS -M your.email@example.com
+#PBS -m abe
+
+############################################
+# Setup
+############################################
+
+# Temporary space (fast local scratch)
+export TMPDIR=/scratch/oy87/cw9909/tmp
+mkdir -p $TMPDIR
+
+# Move into your repo
+cd /home/561/cw9909
+
+# Load CUDA
+module load cuda/12.8.0
+
+# Activate conda env
+source ~/.bashrc
+conda activate /g/data/oy87/cw9909/conda_envs/cw9909
+
+# Output directory for results
+RESULTS_DIR=/home/561/cw9909/eval_results
+mkdir -p $RESULTS_DIR
+
+# Path to GLUE data
+export GLUE_DATA=/g/data/oy87/cw9909/glue_data
+
+# Longformer checkpoint (HuggingFace directory)
+CHECKPOINT=/g/data/oy87/cw9909/llm_jepa/checkpoints/longformer/checkpoint-20000
+
+echo "=========================================="
+echo "Running GLUE evaluation on Longformer"
+echo "Checkpoint: $CHECKPOINT"
+echo "Started at: $(date)"
+echo "=========================================="
+echo ""
+
+############################################
+# Run GLUE evaluation
+############################################
+python experiments/llm_jepa_v2/glue_main.py \
+    --model-type longformer \
+    --checkpoint $CHECKPOINT \
+    --output-dir $RESULTS_DIR
+
+echo ""
+echo "=========================================="
+echo "GLUE Evaluation Complete"
+echo "Finished at: $(date)"
+echo "Results saved to: $RESULTS_DIR"
+echo "=========================================="
