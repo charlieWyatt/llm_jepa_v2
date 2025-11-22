@@ -21,7 +21,7 @@ FIELD_MAP = {
     "mnli": ("premise", "hypothesis"),
     "qnli": ("question", "sentence"),
     "rte": ("sentence1", "sentence2"),
-    "wnli": ("sentence", "hypothesis"),
+    "wnli": ("sentence1", "sentence2")
 }
 
 class GLUETask:

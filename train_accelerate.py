@@ -160,10 +160,8 @@ def log_sample_analysis(
             worst_text += "\n"
         worst_text += "---\n\n"
     
-    tracker.log_text({
-        "samples/best_samples": best_text,
-        "samples/worst_samples": worst_text,
-    }, step=global_step)
+    tracker.log_text("samples/best_samples", best_text, step=global_step)
+    tracker.log_text("samples/worst_samples", worst_text, step=global_step)
     
     # Also log statistics
     if best_samples:
