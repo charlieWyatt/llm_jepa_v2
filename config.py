@@ -67,12 +67,12 @@ STRATEGY_CONSTS: StrategyConfig = {
     "TARGET_MODEL_ID": "allenai/longformer-base-4096",
     "DEFAULT_EMA_DECAY": 0.99,
     "BATCH_SIZE": 2,
-    "MAX_STEPS": None,
+    "MAX_STEPS": 5000,
     "CHECKPOINT_INTERVAL": 10000,
     "CHECKPOINT_DIR": "/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa",
     "LOG_INTERVAL": 10,
     "WARMUP_STEPS": 500,
     "LEARNING_RATE": 5e-4,
     "MAX_SEQ_LENGTH": 4096,
-    "EXPERIMENT_TRACKER": 'tensorboard'
+    "EXPERIMENT_TRACKER": 'wandb'
 }

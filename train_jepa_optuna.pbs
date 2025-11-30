@@ -1,0 +1,28 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q dgxa100
+#PBS -l walltime=08:00:00
+#PBS -l ncpus=64
+#PBS -l ngpus=4
+#PBS -l mem=256GB
+#PBS -l jobfs=200GB
+#PBS -l storage=gdata/oy87+scratch/oy87
+#PBS -N optuna_jepa
+#PBS -o /home/561/cw9909/logs/optuna_jepa.out
+#PBS -e /home/561/cw9909/logs/optuna_jepa.err
+
+module load cuda/12.8.0
+source ~/.bashrc
+conda activate /g/data/oy87/cw9909/conda_envs/cw9909
+
+# Change to project directory
+cd /home/561/cw9909/experiments/llm_jepa_v2
+
+# Create temp directory for Optuna configs
+mkdir -p /g/data/oy87/cw9909/tmp
+mkdir -p ./optuna_results
+
+# Run Optuna optimization
+python config_optuna.py
+
+echo "Optuna run completed."

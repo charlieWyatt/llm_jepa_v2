@@ -31,13 +31,14 @@ class ExperimentTracker(ABC):
     """
     
     @abstractmethod
-    def initialize(self, project_name: str, config: Dict[str, Any]) -> None:
+    def initialize(self, project_name: str, config: Dict[str, Any], **kwargs) -> None:
         """
         Initialize the tracking backend.
         
         Args:
             project_name: Name of the experiment/project
             config: Configuration dictionary to track
+            **kwargs: Additional backend-specific arguments (e.g., run_name, tags)
         """
         pass
     
@@ -89,7 +90,7 @@ class TensorBoardTracker(ExperimentTracker):
         self.log_dir = log_dir
         self._initialized = False
     
-    def initialize(self, project_name: str, config: Dict[str, Any]) -> None:
+    def initialize(self, project_name: str, config: Dict[str, Any], **kwargs) -> None:
         """Initialize TensorBoard tracking."""
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
         
@@ -168,29 +169,43 @@ class WandBTracker(ExperimentTracker):
         self.wandb_dir.mkdir(parents=True, exist_ok=True)
         self.run = None
 
-    def initialize(self, project_name: str, config: Dict[str, Any]) -> None:
-        """Initialize WandB in offline mode."""
+    def initialize(self, project_name: str, config: Dict[str, Any], **kwargs) -> None:
+        """
+        Initialize WandB in offline mode.
+        
+        Args:
+            project_name: Name of the WandB project
+            config: Configuration dictionary to log
+            **kwargs: Additional arguments passed to wandb.init (e.g., run_name, tags, etc.)
+        """
+        # Extract run_name if provided, otherwise use default
+        run_name = kwargs.pop('run_name', None)
+        
         self.run = wandb.init(
             project=project_name,
+            name=run_name,
             config=config,
             dir=str(self.wandb_dir),
             mode="offline",
             resume="allow",
+            **kwargs
         )
+        wandb.config.update(config, allow_val_change=True)
 
     def log_metrics(self, metrics: Dict[str, Any], step: int) -> None:
         """Log scalar metrics."""
         if self.run is None:
             raise RuntimeError("Tracker not initialized. Call initialize() first.")
 
-        wandb.log(metrics, step=step)
-
+        wandb.log(metrics, step=step, commit=True)
+    
     def log_text(self, tag: str, text: str, step: int) -> None:
         """Log text or markdown."""
         if self.run is None:
             raise RuntimeError("Tracker not initialized. Call initialize() first.")
 
         wandb.log({tag: wandb.Html(text)}, step=step)
+
 
     def finalize(self) -> None:
         """Finish the WandB run."""
