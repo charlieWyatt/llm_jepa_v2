@@ -1,0 +1,141 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q dgxa100
+#PBS -l walltime=10:00:00
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=64GB
+#PBS -l jobfs=50GB
+#PBS -l storage=gdata/oy87+scratch/oy87
+#PBS -N eval_job
+#PBS -o /home/561/cw9909/logs/eval_${PBS_JOBID}.out
+#PBS -e /home/561/cw9909/logs/eval_${PBS_JOBID}.err
+
+############################################
+# Variables (set via -v flag or defaults)
+############################################
+
+# Defaults
+CHECKPOINT=${CHECKPOINT:-"/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt"}
+EVALS=${EVALS:-"longbench,glue"}
+OUTPUT_NAME=${OUTPUT_NAME:-"eval_results"}
+MODEL_TYPE=${MODEL_TYPE:-"jepa"}
+LONGBENCH_MODE=${LONGBENCH_MODE:-"overall"}
+
+############################################
+# Setup
+############################################
+
+export TMPDIR=/scratch/oy87/cw9909/tmp
+mkdir -p $TMPDIR
+
+cd /home/561/cw9909
+
+module load cuda/12.8.0
+source ~/.bashrc
+conda activate /g/data/oy87/cw9909/conda_envs/cw9909
+
+RESULTS_DIR=/home/561/cw9909/eval_results
+mkdir -p $RESULTS_DIR
+
+export LONGBENCH_DATA=/g/data/oy87/cw9909/longbench_data
+export GLUE_DATA=/g/data/oy87/cw9909/glue_data
+
+echo "=========================================="
+echo "Evaluation Configuration"
+echo "=========================================="
+echo "Job ID:          $PBS_JOBID"
+echo "Job Name:        eval_${OUTPUT_NAME}"
+echo "Checkpoint:      $CHECKPOINT"
+echo "Model type:      $MODEL_TYPE"
+echo "Evaluations:     $EVALS"
+echo "Output name:     $OUTPUT_NAME"
+echo "LongBench mode:  $LONGBENCH_MODE"
+echo "Started at:      $(date)"
+echo "=========================================="
+echo ""
+
+############################################
+# Parse and run evaluations
+############################################
+
+# Convert comma-separated list to array
+IFS=',' read -ra EVAL_ARRAY <<< "$EVALS"
+
+for EVAL in "${EVAL_ARRAY[@]}"; do
+    # Trim whitespace
+    EVAL=$(echo "$EVAL" | xargs)
+    
+    echo ""
+    echo "=========================================="
+    echo "Running $EVAL evaluation"
+    echo "=========================================="
+    
+    case "$EVAL" in
+        longbench|longbench_v2)
+            python experiments/llm_jepa_v2/eval_suite_main.py \
+                --model-type $MODEL_TYPE \
+                --checkpoint $CHECKPOINT \
+                --output-dir $RESULTS_DIR \
+                --eval-suite longbench \
+                --longbench-mode $LONGBENCH_MODE \
+                --output-name $OUTPUT_NAME
+            ;;
+        
+        glue)
+            python experiments/llm_jepa_v2/eval_suite_main.py \
+                --model-type $MODEL_TYPE \
+                --checkpoint $CHECKPOINT \
+                --output-dir $RESULTS_DIR \
+                --eval-suite glue \
+                --output-name $OUTPUT_NAME
+            ;;
+        
+        both)
+            python experiments/llm_jepa_v2/eval_suite_main.py \
+                --model-type $MODEL_TYPE \
+                --checkpoint $CHECKPOINT \
+                --output-dir $RESULTS_DIR \
+                --eval-suite both \
+                --longbench-mode $LONGBENCH_MODE \
+                --output-name $OUTPUT_NAME
+            ;;
+        
+        *)
+            echo "Warning: Unknown evaluation '$EVAL', skipping..."
+            ;;
+    esac
+    
+    if [ $? -ne 0 ]; then
+        echo "Error running $EVAL evaluation!"
+        exit 1
+    fi
+done
+
+echo ""
+echo "=========================================="
+echo "All Evaluations Complete"
+echo "Finished at: $(date)"
+echo "Results saved to: $RESULTS_DIR"
+echo "=========================================="
+
+: '
+############################################
+# EXAMPLES - Copy and paste these commands
+############################################
+
+# Example 1: LongBench only
+qsub -v EVALS="longbench",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt",OUTPUT_NAME="llm_jepa_390k" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 2: LongBench and GLUE
+qsub -v EVALS="longbench,glue",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt",OUTPUT_NAME="llm_jepa_390k" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 3: Just LongBench with domain analysis
+qsub -v EVALS="longbench",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_500000.pt",OUTPUT_NAME="llm_jepa_500k",LONGBENCH_MODE="by_domain" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 4: Just GLUE
+qsub -v EVALS="glue",CHECKPOINT="/path/to/longformer.pt",OUTPUT_NAME="longformer_baseline",MODEL_TYPE="longformer" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 5: Multiple evaluations with difficulty analysis
+qsub -v EVALS="longbench,glue",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt",OUTPUT_NAME="llm_jepa_full",LONGBENCH_MODE="by_difficulty" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+'

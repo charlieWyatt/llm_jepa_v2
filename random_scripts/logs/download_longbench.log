@@ -1,0 +1,31 @@
+Loading python3/3.11.0
+  Loading requirement: intel-mkl/2022.2.0
+Downloading LongBench v2...
+Generating train split: 0 examples [00:00, ? examples/s]Generating train split: 503 examples [00:37, 13.27 examples/s]Generating train split: 503 examples [00:38, 13.04 examples/s]
+Dataset structure: DatasetDict({
+    train: Dataset({
+        features: ['_id', 'domain', 'sub_domain', 'difficulty', 'length', 'question', 'choice_A', 'choice_B', 'choice_C', 'choice_D', 'answer', 'context'],
+        num_rows: 503
+    })
+})
+Saving to /g/data/oy87/cw9909/longbench_data...
+Saving the dataset (0/1 shards):   0%|          | 0/503 [00:00<?, ? examples/s]Saving the dataset (0/1 shards): 100%|██████████| 503/503 [00:02<00:00, 219.04 examples/s]Saving the dataset (1/1 shards): 100%|██████████| 503/503 [00:02<00:00, 219.04 examples/s]Saving the dataset (1/1 shards): 100%|██████████| 503/503 [00:02<00:00, 218.84 examples/s]
+Download complete!
+
+Dataset info:
+Number of examples: 503
+Features: {'_id': Value('string'), 'domain': Value('string'), 'sub_domain': Value('string'), 'difficulty': Value('string'), 'length': Value('string'), 'question': Value('string'), 'choice_A': Value('string'), 'choice_B': Value('string'), 'choice_C': Value('string'), 'choice_D': Value('string'), 'answer': Value('string'), 'context': Value('string')}
+Download complete!
+
+======================================================================================
+                  Resource Usage on 2025-11-30 17:41:03:
+   Job Id:             155603317.gadi-pbs
+   Project:            oy87
+   Exit Status:        0
+   Service Units:      0.17
+   NCPUs Requested:    1                      NCPUs Used: 1               
+                                           CPU Time Used: 00:00:44        
+   Memory Requested:   8.0GB                 Memory Used: 5.02GB          
+   Walltime requested: 02:00:00            Walltime Used: 00:02:32        
+   JobFS requested:    100.0MB                JobFS used: 0B              
+======================================================================================

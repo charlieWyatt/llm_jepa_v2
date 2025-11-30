@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -P oy87
+#PBS -q copyq
+#PBS -l ncpus=1
+#PBS -l mem=8GB
+#PBS -l walltime=2:00:00
+#PBS -l storage=gdata/oy87
+#PBS -l wd
+#PBS -N download_longbench
+#PBS -j oe
+#PBS -o logs/download_longbench.log
+
+# Load modules
+module load python3/3.11.0
+
+# Create output directory
+mkdir -p logs
+
+source ~/.bashrc
+conda activate cw9909
+
+# Run download script
+python /home/561/cw9909/experiments/llm_jepa_v2/random_scripts/download_longbench_v2.py
+
+echo "Download complete!"

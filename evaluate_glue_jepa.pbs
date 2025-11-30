@@ -51,7 +51,7 @@ echo ""
 ############################################
 # Run GLUE evaluation
 ############################################
-python experiments/llm_jepa_v2/glue_main.py \
+python experiments/llm_jepa_v2/eval_suite_main.py \
     --model-type jepa \
     --checkpoint $CHECKPOINT \
     --output-dir $RESULTS_DIR
