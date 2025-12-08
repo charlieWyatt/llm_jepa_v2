@@ -2,6 +2,7 @@ from eval.tasks.longbench_dataset import LongBenchTask, LONGBENCH_DOMAINS
 from eval.probes.linear_probe import train_probe, eval_probe
 from typing import Dict
 import numpy as np
+from sklearn.model_selection import train_test_split
 
 def run_longbench(model_wrapper, config, analysis_mode: str = "overall") -> Dict:
     """
@@ -83,22 +84,21 @@ def run_longbench(model_wrapper, config, analysis_mode: str = "overall") -> Dict
     return results
 
 def _evaluate_split(model_wrapper, config, inputs, labels, split_name):
-    """Helper to evaluate a data split"""
     print(f"\n{split_name}: {len(inputs)} samples")
     
-    # Since LongBench has no train split, we'll use the data itself for training
-    # This gives us an upper bound on performance
-    # For a proper evaluation, you might want to use GLUE or another dataset for training
-    
+    # Extract features first
     print("Extracting features...")
     features = model_wrapper.extract_features(inputs, config)
     
-    # 4-way classification (A/B/C/D)
-    print("Training 4-way classifier...")
-    probe = train_probe(features, labels, is_regression=False, max_iter=config.max_iter)
+    # Split into train/test for the linear probe
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, labels, test_size=0.2, random_state=42, stratify=labels
+    )
     
-    print("Evaluating...")
-    metrics = eval_probe(probe, features, labels, is_regression=False)
+    print(f"Training probe on {len(X_train)} samples...")
+    probe = train_probe(X_train, y_train, is_regression=False, max_iter=config.max_iter)
     
-    print(f"Results: {metrics}")
+    print(f"Evaluating on {len(X_test)} samples...")
+    metrics = eval_probe(probe, X_test, y_test, is_regression=False)
+    
     return metrics

@@ -8,8 +8,8 @@
 #PBS -l jobfs=50GB
 #PBS -l storage=gdata/oy87+scratch/oy87
 #PBS -N eval_job
-#PBS -o /home/561/cw9909/logs/eval_${PBS_JOBID}.out
-#PBS -e /home/561/cw9909/logs/eval_${PBS_JOBID}.err
+#PBS -o /home/561/cw9909/logs/
+#PBS -e /home/561/cw9909/logs/
 
 ############################################
 # Variables (set via -v flag or defaults)
@@ -124,18 +124,34 @@ echo "=========================================="
 # EXAMPLES - Copy and paste these commands
 ############################################
 
-# Example 1: LongBench only
+# ===== JEPA Examples =====
+
+# Example 1: LongBench only (JEPA 390k)
 qsub -v EVALS="longbench",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt",OUTPUT_NAME="llm_jepa_390k" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
 
-# Example 2: LongBench and GLUE
+# Example 2: GLUE only (JEPA 390k)
+qsub -v EVALS="glue",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt",OUTPUT_NAME="llm_jepa_390k" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 3: Both GLUE and LongBench (JEPA 390k)
 qsub -v EVALS="longbench,glue",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt",OUTPUT_NAME="llm_jepa_390k" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
 
-# Example 3: Just LongBench with domain analysis
-qsub -v EVALS="longbench",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_500000.pt",OUTPUT_NAME="llm_jepa_500k",LONGBENCH_MODE="by_domain" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+# Example 4: LongBench with domain analysis (JEPA)
+qsub -v EVALS="longbench",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt",OUTPUT_NAME="llm_jepa_390k_domains",LONGBENCH_MODE="by_domain" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
 
-# Example 4: Just GLUE
-qsub -v EVALS="glue",CHECKPOINT="/path/to/longformer.pt",OUTPUT_NAME="longformer_baseline",MODEL_TYPE="longformer" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+# ===== Longformer Examples (checkpoint-27000) =====
 
-# Example 5: Multiple evaluations with difficulty analysis
-qsub -v EVALS="longbench,glue",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa/patch_size_2/checkpoint_step_390000.pt",OUTPUT_NAME="llm_jepa_full",LONGBENCH_MODE="by_difficulty" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+# Example 5: GLUE only (Longformer)
+qsub -v EVALS="glue",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/longformer/checkpoint-27000",OUTPUT_NAME="longformer_27k",MODEL_TYPE="longformer" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 6: LongBench only (Longformer)
+qsub -v EVALS="longbench",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/longformer/checkpoint-27000",OUTPUT_NAME="longformer_27k",MODEL_TYPE="longformer" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 7: Both evaluations (Longformer)
+qsub -v EVALS="longbench,glue",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/longformer/checkpoint-27000",OUTPUT_NAME="longformer_27k",MODEL_TYPE="longformer" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 8: LongBench with difficulty analysis (Longformer)
+qsub -v EVALS="longbench",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/longformer/checkpoint-27000",OUTPUT_NAME="longformer_27k_diff",MODEL_TYPE="longformer",LONGBENCH_MODE="by_difficulty" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
+
+# Example 9: LongBench by domain (Longformer)
+qsub -v EVALS="longbench",CHECKPOINT="/g/data/oy87/cw9909/llm_jepa/checkpoints/longformer/checkpoint-27000",OUTPUT_NAME="longformer_27k_domains",MODEL_TYPE="longformer",LONGBENCH_MODE="by_domain" /home/561/cw9909/experiments/llm_jepa_v2/evals.pbs
 '

@@ -7,8 +7,9 @@ from pathlib import Path
 
 # Path to JEPA training script and evaluation script
 TRAIN_SCRIPT = "/home/561/cw9909/experiments/llm_jepa_v2/train_optuna.py"
-EVAL_SCRIPT  = "/home/561/cw9909/experiments/llm_jepa_v2/run_glue_eval.py"
+EVAL_SCRIPT = "/home/561/cw9909/experiments/llm_jepa_v2/eval_suite_main.py"  # ← FIXED
 CHECKPOINT_DIR = "/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa"
+RESULTS_DIR = "/home/561/cw9909/eval_results"
 
 def objective(trial: optuna.Trial):
     """Hyperparameter objective for JEPA training -> GLUE eval."""
@@ -43,27 +44,43 @@ def objective(trial: optuna.Trial):
 
     # Find latest checkpoint for this trial
     trial_ckpt_dir = f"{CHECKPOINT_DIR}/trial_{trial.number}"
-    ckpts = sorted(Path(trial_ckpt_dir).glob("**/*.pt"))
+    ckpts = sorted(Path(trial_ckpt_dir).glob("**/checkpoint_final.pt"))
     if not ckpts:
         raise RuntimeError(f"No checkpoint found for trial {trial.number}")
     ckpt = ckpts[-1]
 
-    # Run GLUE Evaluation
-    os.makedirs("./optuna_results", exist_ok=True)
-    eval_out = f"./optuna_results/optuna_eval_{trial.number}.json"
+    # Run GLUE Evaluation using eval_suite_main.py
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    output_name = f"optuna_trial_{trial.number}"
+    
     subprocess.run([
         "python", EVAL_SCRIPT,
         "--model-type", "jepa",
         "--checkpoint", str(ckpt),
-        "--output", eval_out
+        "--output-dir", RESULTS_DIR,
+        "--eval-suite", "glue",
+        "--output-name", output_name
     ], check=True)
 
-    # Load GLUE scores
+    # Load GLUE scores - the filename format is {output_name}_glue_results.json
+    eval_out = f"{RESULTS_DIR}/{output_name}_glue_results.json"
     with open(eval_out, "r") as f:
-        glue_scores = json.load(f)
+        glue_results = json.load(f)
 
-    # Average score across tasks
-    mean_score = sum(v["score"] for v in glue_scores.values()) / len(glue_scores)
+    # Extract average score across all GLUE tasks
+    # The structure is likely: {"task_name": {"accuracy": 0.XX, ...}, ...}
+    scores = []
+    for task_name, task_results in glue_results.items():
+        # Get the primary metric (usually 'accuracy' or 'score')
+        if 'accuracy' in task_results:
+            scores.append(task_results['accuracy'])
+        elif 'score' in task_results:
+            scores.append(task_results['score'])
+        else:
+            # Take the first numeric value
+            scores.append(next(v for v in task_results.values() if isinstance(v, (int, float))))
+    
+    mean_score = sum(scores) / len(scores)
 
     # Clean up checkpoint to save space (optional)
     # import shutil
