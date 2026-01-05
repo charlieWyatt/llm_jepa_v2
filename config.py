@@ -60,19 +60,20 @@ STRATEGY_CONSTS: StrategyConfig = {
                                     # If random: 15% of tokens masked
     "NUM_TARGETS": 1,              # Number of target blocks
     
-    "CONTEXT_ENCODER": "longformer",
-    "TARGET_PREDICTOR": "longformer",
+    "CONTEXT_ENCODER": "olmo",
+    "TARGET_PREDICTOR": "olmo",
     "LOSS_CALCULATOR": "l2",
-    "CONTEXT_MODEL_ID": "allenai/longformer-base-4096",
-    "TARGET_MODEL_ID": "allenai/longformer-base-4096",
+    "CONTEXT_MODEL_ID": "/g/data/oy87/cw9909/hf_models/OLMo-2-0425-1B-Instruct",
+    "TARGET_MODEL_ID": "/g/data/oy87/cw9909/hf_models/OLMo-2-0425-1B-Instruct",
     "DEFAULT_EMA_DECAY": 0.99,
     "BATCH_SIZE": 2,
     "MAX_STEPS": 5000,
     "CHECKPOINT_INTERVAL": 10000,
-    "CHECKPOINT_DIR": "/g/data/oy87/cw9909/llm_jepa/checkpoints/llm_jepa",
+    "CHECKPOINT_DIR": "/g/data/oy87/cw9909/llm_jepa/checkpoints/olmo_jepa",
     "LOG_INTERVAL": 10,
     "WARMUP_STEPS": 500,
     "LEARNING_RATE": 5e-4,
-    "MAX_SEQ_LENGTH": 4096,
-    "EXPERIMENT_TRACKER": 'wandb'
+    "EXPERIMENT_TRACKER": 'wandb',
+    "LAMBDA_NTP": 1.0,    # Weight for NTP loss (0 = disabled)
+    "LAMBDA_JEPA": 1.0,   # Weight for JEPA loss (0 = disabled)
 }

@@ -2,14 +2,16 @@ from src.builders.base_builder import EnumBuilder
 from enum import Enum
 from typing import Literal
 from src.encoders.context_encoders.longformer import Longformer
+from src.encoders.context_encoders.olmo_encoder import OlmoEncoder
 
 
 class EncodingStrategy(Enum):
     longformer = Longformer
+    olmo = OlmoEncoder
 
 
 # Type for configuration
-EncoderType = Literal["longformer"]
+EncoderType = Literal["longformer", "olmo"]
 
 
 class encoder_builder(EnumBuilder[EncodingStrategy]):

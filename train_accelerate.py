@@ -26,15 +26,17 @@ from dataclasses import dataclass
 from typing import List, Tuple
 import heapq
 from src.experiment_trackers.experiment_tracker import create_tracker, ExperimentTracker
+from src.losses.ntp_loss import compute_ntp_loss
+from src.maskers.jepa_attention_mask import create_jepa_attention_mask
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ============================================
 # HELPER FUNCTIONS
 # ============================================
-def validate_token_length(token_ids):
+def validate_token_length(token_ids, max_seq_length, patch_size):
     """Truncate token sequences that exceed maximum allowed length."""
-    max_allowed_tokens = STRATEGY_CONSTS["PATCH_SIZE"] * STRATEGY_CONSTS["MAX_SEQ_LENGTH"]
+    max_allowed_tokens = patch_size * max_seq_length
     if len(token_ids) > max_allowed_tokens:
         return token_ids[:max_allowed_tokens]
     return token_ids
@@ -48,9 +50,9 @@ def format_time(seconds):
     else:
         return f"{seconds/3600:.1f}h"
 
-# LOGGING HELPERS
+
 # ============================================
-# SAMPLE TRACKING FOR LOGGING
+# SAMPLE TRACKING
 # ============================================
 
 @dataclass
@@ -61,14 +63,39 @@ class TrainingSample:
     text: str
     num_patches: int
     num_targets: int
-    # NEW: Add mask and patch information
-    context_patches: str  # Description of context patches
-    target_patches: str   # Description of target patches
-    patch_texts: List[str]  # Individual patch texts
+    context_patches: str
+    target_patches: str
+    patch_texts: List[str]
     
     def __lt__(self, other):
-        """For heap comparison - lower loss is better."""
         return self.loss < other.loss
+
+
+class SampleTracker:
+    """Tracks best and worst training samples during training."""
+    
+    def __init__(self, k: int = 5):
+        self.k = k
+        self.best_samples: List[TrainingSample] = []
+        self.worst_samples: List[Tuple[float, TrainingSample]] = []
+    
+    def update(self, sample: TrainingSample):
+        if len(self.best_samples) < self.k:
+            heapq.heappush(self.best_samples, sample)
+        elif sample.loss < self.best_samples[0].loss:
+            heapq.heapreplace(self.best_samples, sample)
+        
+        neg_loss_sample = (-sample.loss, sample)
+        if len(self.worst_samples) < self.k:
+            heapq.heappush(self.worst_samples, neg_loss_sample)
+        elif -sample.loss > self.worst_samples[0][0]:
+            heapq.heapreplace(self.worst_samples, neg_loss_sample)
+    
+    def get_best_samples(self) -> List[TrainingSample]:
+        return sorted(self.best_samples, key=lambda x: x.loss)
+    
+    def get_worst_samples(self) -> List[TrainingSample]:
+        return sorted([s for _, s in self.worst_samples], key=lambda x: x.loss, reverse=True)
 
 
 class SampleTracker:
@@ -263,29 +290,30 @@ def describe_mask(mask: torch.Tensor, patch_texts: List[str] = None) -> str:
 
 
 # ============================================
-# TRAINING CONFIGURATION
+# TRAINING
 # ============================================
 def run_train_jepa():
-    # Training hyperparameters - ADJUST THESE
-    NUM_EPOCHS = 1  # Set to 1 for single epoch
-    GRADIENT_ACCUMULATION_STEPS = 4  # Increase effective batch size by 4x
-    BASE_BATCH_SIZE = STRATEGY_CONSTS.get("BATCH_SIZE", 2)  # Per-GPU batch size
+    NUM_EPOCHS = 1
+    GRADIENT_ACCUMULATION_STEPS = 4
+    BASE_BATCH_SIZE = STRATEGY_CONSTS.get("BATCH_SIZE", 2)
     EFFECTIVE_BATCH_SIZE = BASE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
+
+    LAMBDA_NTP = STRATEGY_CONSTS.get("LAMBDA_NTP", 0.0)
+    LAMBDA_JEPA = STRATEGY_CONSTS.get("LAMBDA_JEPA", 1.0)
 
     log_once(f"Training Configuration:", 0)
     log_once(f"  Epochs: {NUM_EPOCHS}", 0)
     log_once(f"  Base batch size per GPU: {BASE_BATCH_SIZE}", 0)
     log_once(f"  Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}", 0)
     log_once(f"  Effective batch size per GPU: {EFFECTIVE_BATCH_SIZE}", 0)
+    log_once(f"  Loss weights - LAMBDA_NTP: {LAMBDA_NTP}, LAMBDA_JEPA: {LAMBDA_JEPA}", 0)
 
     # ============================================
     # ACCELERATE INITIALIZATION
     # ============================================
-
     LOG_DIR = "/g/data/oy87/cw9909/llm_jepa/logs"
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    # Initialize sample tracker
     sample_tracker = SampleTracker(k=5)
     SAMPLE_LOG_INTERVAL = 5000
 
@@ -305,7 +333,6 @@ def run_train_jepa():
         run_name=STRATEGY_CONSTS.get("WANDB_RUN_NAME", None)
     )
 
-    # Get distributed info from Accelerator
     RANK = accelerator.process_index
     LOCAL_RANK = accelerator.local_process_index
     WORLD_SIZE = accelerator.num_processes
@@ -319,17 +346,6 @@ def run_train_jepa():
 
     log_once(json.dumps(STRATEGY_CONSTS), RANK)
 
-    CONTEXT_ENCODER_CONFIG = {
-        "hidden_size": 768,      # CHANGED: 384 → 768
-        "num_layers": 12,        # CHANGED: 6 → 12
-        "attention_window": 512, # CHANGED: 128 → 512 (match Longformer)
-    }
-    TARGET_ENCODER_CONFIG = {
-        "hidden_size": 768,      # CHANGED: 384 → 768
-        "num_layers": 12,        # CHANGED: 2 → 12
-        "attention_window": 512, # CHANGED: 256 → 512
-    }
-
     # ----------------------------
     # Build components
     # ----------------------------
@@ -337,26 +353,24 @@ def run_train_jepa():
     loss_calculator = loss_calculator_builder(
         STRATEGY_CONSTS["LOSS_CALCULATOR"]).build()
 
-    # Context generator (configurable)
     if STRATEGY_CONSTS["CONTEXT_STRATEGY"] == "random":
         context_generator = RandomMaskGenerator(
             mask_ratio=STRATEGY_CONSTS["CONTEXT_MASK_RATIO"]
         )
     elif STRATEGY_CONSTS["CONTEXT_STRATEGY"] == "block":
         context_generator = BlockMaskGenerator(
-            span_ratio=STRATEGY_CONSTS["CONTEXT_MASK_RATIO"]  # Now using ratio!
+            span_ratio=STRATEGY_CONSTS["CONTEXT_MASK_RATIO"]
         )
     else:
         raise ValueError(f"Unknown context strategy: {STRATEGY_CONSTS['CONTEXT_STRATEGY']}")
 
-    # Target generator (configurable)
     if STRATEGY_CONSTS["MASK_STRATEGY"] == "random":
         target_generator = RandomMaskGenerator(
             mask_ratio=STRATEGY_CONSTS["TARGET_MASK_RATIO"]
         )
     elif STRATEGY_CONSTS["MASK_STRATEGY"] == "block":
         target_generator = BlockMaskGenerator(
-            span_ratio=STRATEGY_CONSTS["TARGET_MASK_RATIO"]  # Now using ratio!
+            span_ratio=STRATEGY_CONSTS["TARGET_MASK_RATIO"]
         )
     else:
         raise ValueError(f"Unknown target strategy: {STRATEGY_CONSTS['MASK_STRATEGY']}")
@@ -369,27 +383,36 @@ def run_train_jepa():
 
     context_encoder = encoder_builder(STRATEGY_CONSTS["CONTEXT_ENCODER"]).build(
         model_id=STRATEGY_CONSTS["CONTEXT_MODEL_ID"],
-        config=CONTEXT_ENCODER_CONFIG,
     )
     tokenizer = context_encoder.tokenizer
 
+    hidden_size = context_encoder.hidden_size
+    max_seq_length = context_encoder.max_seq_length
 
-    # Calculate steps per epoch
+    # Setup for NTP if needed
+    lm_head = None
+    vocab_size = len(tokenizer)
+    if LAMBDA_NTP > 0:
+        if hasattr(context_encoder.model, 'lm_head'):
+            lm_head = context_encoder.model.lm_head
+            log_once("Using existing LM head from model", RANK)
+        else:
+            lm_head = nn.Linear(context_encoder.hidden_size, vocab_size, bias=False)
+            log_once(f"Created new LM head: {context_encoder.hidden_size} -> {vocab_size}", RANK)
+
+    # Calculate steps
     TOTAL_DATASET_SIZE = 9999999999999
     STEPS_PER_EPOCH = TOTAL_DATASET_SIZE // (BASE_BATCH_SIZE * WORLD_SIZE)
     if STRATEGY_CONSTS.get("MAX_STEPS") is not None:
         MAX_STEPS = STRATEGY_CONSTS["MAX_STEPS"]
-        NUM_EPOCHS = 1  # Force single "epoch" when using MAX_STEPS
+        NUM_EPOCHS = 1
         log_once(f"Using MAX_STEPS override from config: {MAX_STEPS}", RANK)
     else:
         MAX_STEPS = STEPS_PER_EPOCH * NUM_EPOCHS
         log_once(f"Calculated MAX_STEPS from epochs: {MAX_STEPS}", RANK)
 
     log_once(f"Dataset Configuration:", RANK)
-    log_once(f"  Total dataset size: {TOTAL_DATASET_SIZE:,}", RANK)
-    log_once(f"  Steps per epoch: {STEPS_PER_EPOCH:,}", RANK)
     log_once(f"  Total training steps: {MAX_STEPS:,}", RANK)
-    log_once(f"  Total samples to process: {MAX_STEPS * BASE_BATCH_SIZE * WORLD_SIZE:,}", RANK)
 
     embedding_patcher = patcher_builder(
         STRATEGY_CONSTS["PATCH_STRATEGY"]).build(patch_size=STRATEGY_CONSTS["PATCH_SIZE"])
@@ -398,7 +421,6 @@ def run_train_jepa():
     class TextTokenizer:
         def __init__(self, tokenizer):
             self.tokenizer = tokenizer
-
         def create_patches(self, text: str):
             return self.tokenizer.tokenize(text)
 
@@ -406,13 +428,15 @@ def run_train_jepa():
     dataloader = dataloader_builder(STRATEGY_CONSTS["TRAINING_DATASET"]).build(
         text_tokenizer, batch_size=BASE_BATCH_SIZE)
 
-    predictor = SimplePredictor(hidden_dim=CONTEXT_ENCODER_CONFIG["hidden_size"])
+    predictor = SimplePredictor(hidden_dim=hidden_size)
 
-    # ----------------------------
-    # Create optimizers BEFORE prepare()
-    # ----------------------------
+    # Optimizer params
+    encoder_params = list(context_encoder.parameters())
+    if lm_head is not None and not hasattr(context_encoder.model, 'lm_head'):
+        encoder_params += list(lm_head.parameters())
+
     optimizer = torch.optim.AdamW(
-        context_encoder.parameters(),
+        encoder_params,
         lr=STRATEGY_CONSTS.get("LEARNING_RATE", 1e-4),
         weight_decay=0.01
     )
@@ -423,40 +447,37 @@ def run_train_jepa():
         weight_decay=0.01
     )
 
-    # ----------------------------
     # Target Encoder (EMA)
-    # ----------------------------
     target_encoder = ema_target_encoder(
         context_encoder, STRATEGY_CONSTS["DEFAULT_EMA_DECAY"])
     target_encoder.eval()
     for p in target_encoder.parameters():
         p.requires_grad = False
 
-    # ----------------------------
     # ACCELERATE PREPARE
-    # ----------------------------
-    context_encoder, predictor, optimizer, predictor_optimizer, dataloader = accelerator.prepare(
-        context_encoder, predictor, optimizer, predictor_optimizer, dataloader
-    )
-
+    if lm_head is not None and not hasattr(context_encoder.model, 'lm_head'):
+        context_encoder, predictor, lm_head, optimizer, predictor_optimizer, dataloader = accelerator.prepare(
+            context_encoder, predictor, lm_head, optimizer, predictor_optimizer, dataloader
+        )
+    else:
+        context_encoder, predictor, optimizer, predictor_optimizer, dataloader = accelerator.prepare(
+            context_encoder, predictor, optimizer, predictor_optimizer, dataloader
+        )
     target_encoder = target_encoder.to(device)
 
-    # ----------------------------
-    # Training Loop
-    # ----------------------------
+    # Checkpoint dir
     base_checkpoint_dir = STRATEGY_CONSTS.get("CHECKPOINT_DIR", "./checkpoints")
     checkpoint_dir = os.path.join(base_checkpoint_dir, f"patch_size_{STRATEGY_CONSTS['PATCH_SIZE']}")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     log_once("Starting training loop...", RANK)
 
-    # Initialize progress tracking
+    # Progress tracking
     training_start = time.time()
     total_samples = 0
     global_step = 0
     epoch_samples = 0
 
-    # Outer loop for epochs
     for epoch in range(NUM_EPOCHS):
         log_once(f"\n{'='*60}", RANK)
         log_once(f"Starting Epoch {epoch + 1}/{NUM_EPOCHS}", RANK)
@@ -493,16 +514,16 @@ def run_train_jepa():
                 if len(tokens) == 0:
                     continue
                 token_ids = tokenizer.convert_tokens_to_ids(tokens)
-                token_ids = validate_token_length(token_ids)
+                token_ids = validate_token_length(token_ids, max_seq_length, STRATEGY_CONSTS["PATCH_SIZE"])
                 batch_token_ids.append(token_ids)
                 max_len = max(max_len, len(token_ids))
 
             if len(batch_token_ids) == 0:
                 continue
 
-            batch_size = len(batch_token_ids)
-            total_samples += batch_size
-            epoch_samples += batch_size
+            B = len(batch_token_ids)
+            total_samples += B
+            epoch_samples += B
 
             # Pad sequences
             padded_ids = []
@@ -518,90 +539,126 @@ def run_train_jepa():
             input_ids = torch.tensor(padded_ids, device=device)
             attention_mask = torch.tensor(attention_masks, device=device).float()
 
-            # Create patches
-            context_patch_embeds, patched_attention_mask = create_patched_embeddings(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                embedding_layer=accelerator.unwrap_model(context_encoder).get_input_embeddings(),
-                patcher=embedding_patcher,
-                patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
-            )
-
-            with torch.no_grad():
-                target_patch_embeds = context_patch_embeds.detach().clone()
-
-            # Create masks
-            B, L_patches, D = context_patch_embeds.shape
-            dummy_input_ids = torch.zeros(B, L_patches, dtype=torch.long, device=device)
-
-            mask_pair = context_target_creator.create_context_and_targets(
-                input_ids=dummy_input_ids,
-                attention_mask=patched_attention_mask
-            )
-
-            context_mask = mask_pair.context_mask
-            target_mask = mask_pair.target_masks[0]
-            context_mask = context_mask * (1 - target_mask)
-
-            # Global max targets
-            local_max_targets = int(target_mask.sum(dim=1).max().item())
-            if IS_DIST:
-                max_targets_tensor = torch.tensor(local_max_targets, device=device)
-                torch.distributed.all_reduce(max_targets_tensor, op=torch.distributed.ReduceOp.MAX)
-                global_max_targets = int(max_targets_tensor.item())
-            else:
-                global_max_targets = local_max_targets
-
             # Use accelerator's context manager for gradient accumulation
             with accelerator.accumulate(context_encoder, predictor):
-                # Forward pass
-                context_output = accelerator.unwrap_model(context_encoder).model(
-                    inputs_embeds=context_patch_embeds,
-                    attention_mask=patched_attention_mask,
-                )
-                context_repr = context_output.last_hidden_state
-
-                with torch.no_grad():
-                    target_output = target_encoder.model(
-                        inputs_embeds=target_patch_embeds,
-                        attention_mask=patched_attention_mask,
+                # ============================================
+                # NTP LOSS (if enabled)
+                # ============================================
+                loss_ntp = torch.tensor(0.0, device=device)
+                if LAMBDA_NTP > 0:
+                    unwrapped_encoder = accelerator.unwrap_model(context_encoder)
+                    unwrapped_lm_head = accelerator.unwrap_model(lm_head) if lm_head is not None else unwrapped_encoder.model.lm_head
+                    
+                    loss_ntp = compute_ntp_loss(
+                        encoder=unwrapped_encoder,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        lm_head=unwrapped_lm_head,
+                        vocab_size=vocab_size,
+                        pad_token_id=tokenizer.pad_token_id,
                     )
-                    target_repr = target_output.last_hidden_state
 
-                # Apply masks
-                masked_context_repr = context_repr * context_mask.unsqueeze(-1)
+                # ============================================
+                # JEPA LOSS (if enabled)
+                # ============================================
+                loss_jepa = torch.tensor(0.0, device=device)
+                L_patches = 0
+                num_targets_total = 0
+                context_mask = None
+                target_mask = None
+                
+                if LAMBDA_JEPA > 0:
+                    # Create patches
+                    context_patch_embeds, patched_attention_mask = create_patched_embeddings(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        embedding_layer=accelerator.unwrap_model(context_encoder).get_input_embeddings(),
+                        patcher=embedding_patcher,
+                        patch_size=STRATEGY_CONSTS["PATCH_SIZE"]
+                    )
 
-                # Predict targets
-                predicted_targets = predictor(
-                    masked_context_repr,
-                    target_mask,
-                    context_mask,
-                    global_max_targets
-                )
+                    with torch.no_grad():
+                        target_patch_embeds = context_patch_embeds.detach().clone()
 
-                # Extract ground truth
-                actual_targets = extract_target_representations(
-                    target_repr,
-                    target_mask,
-                    global_max_targets
-                ).detach()
+                    # Create masks
+                    _, L_patches, D = context_patch_embeds.shape
+                    dummy_input_ids = torch.zeros(B, L_patches, dtype=torch.long, device=device)
 
-                # Compute loss
-                loss = loss_calculator(predicted_targets, actual_targets)
+                    mask_pair = context_target_creator.create_context_and_targets(
+                        input_ids=dummy_input_ids,
+                        attention_mask=patched_attention_mask
+                    )
 
-                if torch.isnan(loss) or torch.isinf(loss):
+                    context_mask = mask_pair.context_mask
+                    target_mask = mask_pair.target_masks[0]
+                    context_mask = context_mask * (1 - target_mask)
+
+                    # Create attention mask that blocks targets
+                    jepa_attention_mask = create_jepa_attention_mask(
+                        patched_attention_mask,
+                        context_mask,
+                        target_mask
+                    )
+
+                    # Global max targets
+                    local_max_targets = int(target_mask.sum(dim=1).max().item())
+                    if IS_DIST:
+                        max_targets_tensor = torch.tensor(local_max_targets, device=device)
+                        torch.distributed.all_reduce(max_targets_tensor, op=torch.distributed.ReduceOp.MAX)
+                        global_max_targets = int(max_targets_tensor.item())
+                    else:
+                        global_max_targets = local_max_targets
+
+                    num_targets_total = int(target_mask.sum().item())
+
+                    # Forward pass with JEPA attention mask
+                    context_output = accelerator.unwrap_model(context_encoder).model(
+                        inputs_embeds=context_patch_embeds,
+                        attention_mask=jepa_attention_mask,
+                    )
+                    context_repr = context_output.last_hidden_state
+
+                    with torch.no_grad():
+                        target_output = target_encoder.model(
+                            inputs_embeds=target_patch_embeds,
+                            attention_mask=patched_attention_mask,
+                        )
+                        target_repr = target_output.last_hidden_state
+
+                    # Apply masks and predict
+                    masked_context_repr = context_repr * context_mask.unsqueeze(-1)
+
+                    predicted_targets = predictor(
+                        masked_context_repr,
+                        target_mask,
+                        context_mask,
+                        global_max_targets
+                    )
+
+                    actual_targets = extract_target_representations(
+                        target_repr,
+                        target_mask,
+                        global_max_targets
+                    ).detach()
+
+                    loss_jepa = loss_calculator(predicted_targets, actual_targets)
+
+                # ============================================
+                # COMBINED LOSS
+                # ============================================
+                total_loss = LAMBDA_NTP * loss_ntp + LAMBDA_JEPA * loss_jepa
+
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
                     logi(f"Step {global_step} - WARNING: Invalid loss detected!", RANK)
                     continue
 
                 # ============================================
-                # TRACK SAMPLES (MOVED OUTSIDE LOG_INTERVAL)
+                # TRACK SAMPLES
                 # ============================================
-                if RANK == 0:  # Only track on main process
-                    # Track each sample in the batch
+                if RANK == 0 and LAMBDA_JEPA > 0 and context_mask is not None:
                     for i in range(B):
                         sample_text = reconstruct_text_from_batch(original_token_batch, i, tokenizer)
                         
-                        # Get patch breakdown
                         if i < len(original_token_batch):
                             patch_texts = get_patch_texts(
                                 original_token_batch[i],
@@ -611,13 +668,12 @@ def run_train_jepa():
                         else:
                             patch_texts = []
                         
-                        # Describe masks for this sample
                         context_desc = describe_mask(context_mask[i], patch_texts)
                         target_desc = describe_mask(target_mask[i], patch_texts)
                         
                         sample = TrainingSample(
                             step=global_step,
-                            loss=loss.item(),
+                            loss=total_loss.item(),
                             text=sample_text,
                             num_patches=L_patches,
                             num_targets=int(target_mask[i].sum().item()),
@@ -627,22 +683,22 @@ def run_train_jepa():
                         )
                         sample_tracker.update(sample)
 
-                # Backward (handled by accelerator's accumulate context)
-                accelerator.backward(loss)
+                # Backward
+                accelerator.backward(total_loss)
 
-                # Calculate gradient norm (only when we're about to step)
+                # Calculate gradient norm
                 if accelerator.sync_gradients:
                     total_norm = calculate_gradient_norm(accelerator.unwrap_model(context_encoder))
                 else:
                     total_norm = 0.0
 
-                # Step optimizers (only happens when accumulation is complete)
+                # Step optimizers
                 optimizer.step()
                 predictor_optimizer.step()
                 optimizer.zero_grad()
                 predictor_optimizer.zero_grad()
 
-                # Update EMA target encoder (only on actual optimizer steps)
+                # Update EMA target encoder
                 if accelerator.sync_gradients:
                     target_encoder.update(accelerator.unwrap_model(context_encoder))
 
@@ -651,10 +707,8 @@ def run_train_jepa():
             epoch_elapsed = time.time() - epoch_start
             throughput = epoch_samples / epoch_elapsed if epoch_elapsed > 0 else 0
             
-            # Update progress bar
             pbar.update(1)
             
-            # Calculate ETA for current epoch
             steps_remaining = STEPS_PER_EPOCH - batch_idx - 1
             if throughput > 0 and steps_remaining > 0:
                 samples_remaining = steps_remaining * BASE_BATCH_SIZE
@@ -664,9 +718,10 @@ def run_train_jepa():
                 eta_str = "?"
 
             pbar.set_postfix({
-                'loss': f'{loss.item():.4f}', 
+                'loss': f'{total_loss.item():.4f}',
+                'ntp': f'{loss_ntp.item():.3f}' if LAMBDA_NTP > 0 else '-',
+                'jepa': f'{loss_jepa.item():.3f}' if LAMBDA_JEPA > 0 else '-',
                 'samples/s': f'{throughput:.1f}',
-                'ETA': eta_str
             })
 
             if global_step % STRATEGY_CONSTS["LOG_INTERVAL"] == 0 or global_step == 1:
@@ -675,32 +730,37 @@ def run_train_jepa():
                 training_loop_log(
                     step=global_step,
                     max_steps=MAX_STEPS,
-                    loss=loss.item(),
+                    loss=total_loss.item(),
                     learning_rate=current_lr,
                     grad_norm=total_norm,
                     batch_size=B,
                     num_patches=L_patches,
-                    num_targets=int(target_mask.sum().item()),
+                    num_targets=num_targets_total,
                     rank=RANK
                 )
                 
-                tracker.log_metrics({
-                    "train/loss": loss.item(),
+                metrics = {
+                    "train/loss_total": total_loss.item(),
                     "train/learning_rate": current_lr,
-                    "train/grad_norm": total_norm,
                     "train/batch_size": B,
-                    "train/num_patches": L_patches,
-                    "train/num_targets": int(target_mask.sum().item()),
                     "train/step_time": step_time,
                     "train/throughput": throughput,
                     "train/total_samples": total_samples,
                     "train/epoch": epoch + 1,
                     "train/epoch_progress": batch_idx / STEPS_PER_EPOCH,
-                }, step=global_step)
+                }
+                
+                if LAMBDA_NTP > 0:
+                    metrics["train/loss_ntp"] = loss_ntp.item()
+                if LAMBDA_JEPA > 0:
+                    metrics["train/loss_jepa"] = loss_jepa.item()
+                    metrics["train/num_patches"] = L_patches
+                    metrics["train/num_targets"] = num_targets_total
+                if accelerator.sync_gradients:
+                    metrics["train/grad_norm"] = total_norm
+                
+                tracker.log_metrics(metrics, step=global_step)
 
-            # ============================================
-            # LOG SAMPLE ANALYSIS
-            # ============================================
             if global_step % SAMPLE_LOG_INTERVAL == 0:
                 log_sample_analysis(
                     tracker=tracker,
@@ -710,7 +770,6 @@ def run_train_jepa():
                     rank=RANK
                 )
 
-            # Checkpointing
             if STRATEGY_CONSTS.get("CHECKPOINT_INTERVAL") and global_step % STRATEGY_CONSTS["CHECKPOINT_INTERVAL"] == 0:
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
@@ -719,7 +778,7 @@ def run_train_jepa():
                         step=global_step,
                         engine=accelerator.unwrap_model(context_encoder),
                         optimizer=optimizer,
-                        loss=loss.item(),
+                        loss=total_loss.item(),
                         config=cast(Dict[str, Any], {
                             **STRATEGY_CONSTS,
                             "epoch": epoch + 1,
@@ -737,7 +796,6 @@ def run_train_jepa():
         log_once(f"Samples processed: {epoch_samples:,}", RANK)
         log_once(f"Average throughput: {epoch_samples / epoch_time:.1f} samples/s\n", RANK)
         
-        # Save checkpoint at end of epoch
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             save_checkpoint(
@@ -745,7 +803,7 @@ def run_train_jepa():
                 step=global_step,
                 engine=accelerator.unwrap_model(context_encoder),
                 optimizer=optimizer,
-                loss=loss.item(),
+                loss=total_loss.item(),
                 config=cast(Dict[str, Any], {
                     **STRATEGY_CONSTS,
                     "epoch": epoch + 1,
@@ -757,7 +815,6 @@ def run_train_jepa():
             )
         if global_step > MAX_STEPS:
             break
-
 
     total_time = time.time() - training_start
     log_once(f"\n{'='*60}", RANK)

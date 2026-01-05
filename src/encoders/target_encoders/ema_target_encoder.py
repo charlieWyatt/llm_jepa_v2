@@ -16,6 +16,19 @@ class ema_target_encoder(TargetEncoder):
         for param in self.model.parameters():
             param.requires_grad = False
 
+    # === Delegate properties to wrapped context_encoder ===
+    @property
+    def hidden_size(self) -> int:
+        return self.context_encoder.hidden_size
+    
+    @property
+    def num_layers(self) -> int:
+        return self.context_encoder.num_layers
+    
+    @property
+    def max_seq_length(self) -> int:
+        return self.context_encoder.max_seq_length
+
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
