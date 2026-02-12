@@ -113,5 +113,92 @@ def compute_ntp_loss(
         ignore_index=pad_token_id,
         reduction='mean'
     )
-    
+
+    return loss
+
+
+def compute_ntp_loss_code_only(
+    encoder,
+    text_input_ids: torch.Tensor,
+    code_input_ids: torch.Tensor,
+    text_attention_mask: torch.Tensor,
+    code_attention_mask: torch.Tensor,
+    lm_head: nn.Module,
+    vocab_size: int,
+    pad_token_id: int,
+) -> torch.Tensor:
+    """
+    Compute NTP loss on concatenated [text, code] but only supervise code tokens.
+
+    The input is formed as [text_ids | code_ids] with a causal mask.
+    Cross-entropy is computed only on code positions (text labels are ignored).
+
+    Args:
+        encoder: The context encoder (unwrapped)
+        text_input_ids: [B, L_t] text token IDs
+        code_input_ids: [B, L_c] code token IDs
+        text_attention_mask: [B, L_t] attention mask for text
+        code_attention_mask: [B, L_c] attention mask for code
+        lm_head: Linear layer for token prediction
+        vocab_size: Vocabulary size
+        pad_token_id: Padding token ID
+
+    Returns:
+        NTP loss scalar (CE on code tokens only)
+    """
+    B = text_input_ids.shape[0]
+    L_t = text_input_ids.shape[1]
+    L_c = code_input_ids.shape[1]
+    device = text_input_ids.device
+
+    # Concatenate text and code
+    concat_ids = torch.cat([text_input_ids, code_input_ids], dim=1)  # [B, L_t+L_c]
+    concat_mask = torch.cat([text_attention_mask, code_attention_mask], dim=1)  # [B, L_t+L_c]
+    L = L_t + L_c
+
+    # Get token embeddings
+    token_embeds = encoder.get_input_embeddings()(concat_ids)
+
+    # Create causal mask [B, 1, L, L]
+    causal_mask = torch.tril(torch.ones(L, L, device=device))
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, L, L).clone()
+
+    # Apply padding
+    padding_mask = concat_mask.unsqueeze(1).unsqueeze(2).float()  # [B, 1, 1, L]
+    causal_mask = causal_mask * padding_mask
+
+    # Convert to additive mask
+    causal_mask = (1.0 - causal_mask) * -10000.0
+
+    # Forward pass
+    output = encoder.model(
+        inputs_embeds=token_embeds,
+        attention_mask=causal_mask,
+    )
+    hidden_states = output.last_hidden_state
+
+    # Get logits
+    lm_logits = lm_head(hidden_states)
+
+    # Shift for causal prediction
+    shift_logits = lm_logits[:, :-1, :].contiguous()  # [B, L-1, V]
+    shift_labels = concat_ids[:, 1:].contiguous()       # [B, L-1]
+
+    # Build label mask: ignore text positions, only supervise code positions.
+    # After shifting, position i predicts token i+1.
+    # Code tokens occupy positions L_t .. L_t+L_c-1 in concat_ids.
+    # So shifted labels for code start at index L_t-1 (predicting token at L_t).
+    ignore_mask = torch.full_like(shift_labels, pad_token_id)
+    ignore_mask[:, L_t - 1:] = shift_labels[:, L_t - 1:]
+    # Also mask out padding within code region
+    shift_code_mask = concat_mask[:, 1:]  # [B, L-1]
+    ignore_mask = torch.where(shift_code_mask == 1, ignore_mask, torch.tensor(pad_token_id, device=device))
+
+    loss = F.cross_entropy(
+        shift_logits.view(-1, vocab_size),
+        ignore_mask.view(-1),
+        ignore_index=pad_token_id,
+        reduction='mean'
+    )
+
     return loss

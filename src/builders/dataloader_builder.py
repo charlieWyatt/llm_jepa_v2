@@ -3,15 +3,17 @@ from enum import Enum
 from typing import Literal
 from src.dataloaders.recipe1m_dataloader import RecipeDataloader
 from src.dataloaders.dolma_sample_dataloader import DolmaSampleDataloader
+from src.dataloaders.nl_rx_synth_dataloader import NLRXSynthDataloader
 
 
 class Dataset(Enum):
     recipe = RecipeDataloader
     dolma_sample = DolmaSampleDataloader
+    nl_rx_synth = NLRXSynthDataloader
 
 
 # Type for configuration
-DatasetType = Literal["recipe", "dolma_sample"]
+DatasetType = Literal["recipe", "dolma_sample", "nl_rx_synth"]
 
 
 class dataloader_builder(EnumBuilder[Dataset]):

@@ -42,6 +42,13 @@ class StrategyConfig(TypedDict, total=False):  # total=False allows optional fie
 
     EXPERIMENT_TRACKER: str
 
+    # Paired (text, code) training
+    MAX_TEXT_TOKENS: int
+    MAX_CODE_TOKENS: int
+    DATA_PATH: Optional[str]
+    WANDB_RUN_NAME: Optional[str]
+    LAMBDA_NTP: float
+    LAMBDA_JEPA: float
 
 
 STRATEGY_CONSTS: StrategyConfig = {
