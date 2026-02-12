@@ -1,14 +1,15 @@
-from datasets import load_dataset, DownloadConfig
+import json
 from pathlib import Path
 
 # Default local path for Gadi HPC (pre-downloaded)
 LOCAL_DATA_PATH = "/g/data/oy87/cw9909/datasets/nl_rx_synth"
-HF_DATASET_ID = "CatherineYeh/NL-RX-Synth"
 
 
 class NLRXSynthDataloader:
     """
     Paired (text, code) dataloader for NL-RX-Synth dataset.
+
+    Source: https://github.com/nicholaslocascio/deep-regex
 
     Each sample contains:
       - "nl": natural language description
@@ -28,15 +29,17 @@ class NLRXSynthDataloader:
         self.patcher = patcher
 
         local_dir = Path(data_path) if data_path else Path(LOCAL_DATA_PATH)
-        if local_dir.exists():
-            self.dataset = load_dataset(
-                "json",
-                data_files=str(local_dir / "*.json"),
-                split="train",
-                download_config=DownloadConfig(local_files_only=True),
+        data_file = local_dir / "train.json"
+        if not data_file.exists():
+            raise FileNotFoundError(
+                f"Dataset not found at {data_file}. "
+                "Run scripts/download_nl_rx_synth.py first."
             )
-        else:
-            self.dataset = load_dataset(HF_DATASET_ID, split="train")
+
+        with open(data_file, "r") as f:
+            self.samples = json.load(f)
+
+        print(f"Loaded {len(self.samples)} NL-RX-Synth samples from {data_file}")
 
     def __iter__(self):
         batch_text_tokens = []
@@ -44,7 +47,7 @@ class NLRXSynthDataloader:
         batch_raw_text = []
         batch_raw_code = []
 
-        for ex in self.dataset:
+        for ex in self.samples:
             nl = ex.get("nl", "")
             regex = ex.get("regex", "")
             if not nl or not regex:
